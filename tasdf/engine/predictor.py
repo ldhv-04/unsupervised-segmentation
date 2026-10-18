@@ -8,7 +8,6 @@ import torch.nn as nn
 
 from tasdf.utils.metrics import (
     colorize_mask,
-    decompose_te_and_blastocoel,
     DEFAULT_CLASS_NAMES,
     DEFAULT_PALETTE,
 )
@@ -16,8 +15,7 @@ from tasdf.utils.metrics import (
 
 class Predictor:
     """
-    Động cơ suy luận và trực quan hóa phân đoạn phôi học:
-    Nhận ảnh đầu vào bất kỳ, xuất mặt nạ phân đoạn rời rạc, ảnh overlay và ảnh ghép 3 khung.
+    Động cơ suy luận và trực quan hóa phân đoạn phôi học thuần túy từ dự đoán của mạng TASDF.
     """
 
     def __init__(
@@ -27,27 +25,22 @@ class Predictor:
         palette: dict[int, tuple[int, int, int]] | None = None,
         class_names: dict[int, str] | None = None,
         branch: str = "net1",
-        decompose: bool = False,
-        te_thickness_ratio: float = 0.06,
     ):
         self.image_size = image_size
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.palette = palette or DEFAULT_PALETTE
         self.class_names = class_names or DEFAULT_CLASS_NAMES
         self.branch = branch
-        self.decompose = decompose
-        self.te_thickness_ratio = te_thickness_ratio
 
     def predict_single(
         self, model: nn.Module, img_path: str | Path
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Suy luận trên một ảnh duy nhất."""
+        """Suy luận trực tiếp trên một ảnh duy nhất."""
         path = Path(img_path)
         orig_img = Image.open(path).convert("RGB")
         orig_w, orig_h = orig_img.size
         orig_np = np.array(orig_img)
 
-        # Chuẩn hóa về kích thước mạng 1 kênh xám
         gray_resized = orig_img.convert("L").resize((self.image_size, self.image_size))
         img_tensor = (
             torch.tensor(np.array(gray_resized, dtype=np.float32) / 255.0)
@@ -67,14 +60,9 @@ class Predictor:
 
             pred_small = torch.argmax(probs, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
 
-        # Phóng to mặt nạ về đúng kích thước gốc
         pred_orig = cv2.resize(
             pred_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
         )
-        if self.decompose:
-            pred_orig = decompose_te_and_blastocoel(
-                pred_orig, te_thickness_ratio=self.te_thickness_ratio
-            )
         return orig_np, pred_orig
 
     def save_results(
@@ -84,7 +72,6 @@ class Predictor:
         out_dir.mkdir(parents=True, exist_ok=True)
         color_mask = colorize_mask(pred_mask, self.palette)
 
-        # Ảnh phủ mờ (Alpha Blending: 65% ảnh gốc + 35% nhãn màu)
         overlay = cv2.addWeighted(orig_rgb, 0.65, color_mask, 0.35, 0)
         composite = np.hstack([orig_rgb, color_mask, overlay])
 
@@ -109,7 +96,6 @@ class Predictor:
         model = model.to(self.device)
         out_p = Path(output_dir)
 
-        # Thu thập danh sách file ảnh
         if isinstance(source, (str, Path)):
             src_p = Path(source)
             if src_p.is_file():
@@ -125,7 +111,7 @@ class Predictor:
         for f in files:
             orig_rgb, pred_mask = self.predict_single(model, f)
             counts = {
-                self.class_names.get(c, str(c)): int((pred_mask == c).sum())
+                self.class_names.get(int(c), str(c)): int((pred_mask == c).sum())
                 for c in np.unique(pred_mask)
                 if c > 0
             }

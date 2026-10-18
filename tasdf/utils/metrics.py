@@ -1,5 +1,4 @@
 from typing import Any
-import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,37 +23,64 @@ DEFAULT_PALETTE = {
 def compute_multiclass_dice(
     preds: torch.Tensor, targets: torch.Tensor, num_classes: int = 5
 ) -> float:
-    """Tính mDice trên batch tensor (PyTorch)."""
+    """
+    Tính mDice trên batch tensor (PyTorch), chỉ tính trung bình trên các lớp
+    thực sự xuất hiện trong targets hoặc được mô hình dự đoán (union > 0).
+    """
     pred_classes = torch.argmax(preds, dim=1)
     dice_scores = []
     for c in range(1, num_classes):
         pred_c = (pred_classes == c).float()
         target_c = (targets == c).float()
         intersection = (pred_c * target_c).sum()
-        union = pred_c.sum() + target_c.sum()
-        if union == 0:
-            dice_scores.append(1.0)
-        else:
-            dice_scores.append((2.0 * intersection / (union + 1e-6)).item())
+        total = pred_c.sum() + target_c.sum()
+        if total > 0:
+            dice_scores.append((2.0 * intersection / (total + 1e-6)).item())
     return float(np.mean(dice_scores)) if dice_scores else 0.0
 
 
 def compute_sample_metrics(
     pred_mask: np.ndarray, target_mask: np.ndarray, num_classes: int = 5
-) -> dict[int, dict[str, float]]:
-    """Tính toán chi tiết Dice và IoU cho từng lớp trên một mặt nạ numpy 2D."""
-    metrics = {}
+) -> dict[int, dict[str, Any]]:
+    """
+    Tính toán 4 chỉ số đánh giá chuẩn theo Mục 4.3 bài báo TASDF cho từng lớp:
+    - Accuracy: (TP + TN) / (TP + TN + FP + FN)
+    - Recall:   TP / (TP + FN)
+    - Dice:     2 * TP / (2 * TP + FP + FN)
+    - IoU (Jaccard): TP / (TP + FP + FN)
+    Đồng thời ghi nhận cờ 'present' (target_sum > 0) và 'active' (union > 0)
+    để Validator loại trừ các lớp không tồn tại trong bộ dữ liệu.
+    """
+    metrics: dict[int, dict[str, Any]] = {}
+    total_pixels = float(pred_mask.size)
+
     for c in range(1, num_classes):
         p = pred_mask == c
         t = target_mask == c
-        intersection = np.logical_and(p, t).sum()
-        union = np.logical_or(p, t).sum()
-        total = p.sum() + t.sum()
 
-        dice = (2.0 * intersection / (total + 1e-6)) if total > 0 else 1.0
-        iou = (intersection / (union + 1e-6)) if union > 0 else 1.0
+        tp = float(np.logical_and(p, t).sum())
+        fp = float(np.logical_and(p, np.logical_not(t)).sum())
+        fn = float(np.logical_and(np.logical_not(p), t).sum())
+        tn = total_pixels - tp - fp - fn
 
-        metrics[c] = {"dice": float(dice), "iou": float(iou)}
+        target_sum = tp + fn
+        pred_sum = tp + fp
+        union = tp + fp + fn
+        denom_dice = 2.0 * tp + fp + fn
+
+        accuracy = (tp + tn) / total_pixels if total_pixels > 0 else 0.0
+        recall = (tp / (target_sum + 1e-6)) if target_sum > 0 else (1.0 if pred_sum == 0 else 0.0)
+        dice = (2.0 * tp / (denom_dice + 1e-6)) if denom_dice > 0 else 1.0
+        iou = (tp / (union + 1e-6)) if union > 0 else 1.0
+
+        metrics[c] = {
+            "accuracy": float(accuracy),
+            "recall": float(recall),
+            "dice": float(dice),
+            "iou": float(iou),
+            "present": bool(target_sum > 0),
+            "active": bool(union > 0),
+        }
     return metrics
 
 
@@ -71,50 +97,8 @@ def colorize_mask(
     return color_mask
 
 
-def decompose_te_and_blastocoel(
-    mask: np.ndarray,
-    te_thickness_ratio: float = 0.06,
-    min_thickness: int = 4,
-    max_thickness: int = 20,
-) -> np.ndarray:
-    """
-    Phân rã khối nội phôi (Class 2) thành 2 cấu trúc giải phẫu sinh học:
-    - Vành biểu mô ngoài: Trophectoderm (TE - Class 2)
-    - Khoang dịch rỗng bên trong: Blastocoel (BC - Class 4)
-    Bảo toàn khối tế bào nụ ICM (Class 3) và màng ZP (Class 1).
-    """
-    decomposed = mask.copy()
-    inner_mask = (mask == 2).astype(np.uint8)
-
-    area = int(np.sum(inner_mask))
-    if area < 100:
-        return decomposed
-
-    # Bán kính tương đương R = sqrt(Area / pi)
-    equiv_radius = np.sqrt(area / np.pi)
-    thickness = int(np.clip(equiv_radius * te_thickness_ratio, min_thickness, max_thickness))
-
-    # Co hình thái học (Erosion) bằng phần tử elip
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * thickness + 1, 2 * thickness + 1))
-    cavity_mask = cv2.erode(inner_mask, kernel)
-
-    # Gán lõi trung tâm thành Blastocoel (Class 4), loại trừ ICM (Class 3)
-    is_cavity = (cavity_mask > 0) & (mask != 3)
-    decomposed[is_cavity] = 4
-
-    return decomposed
-
-
 def get_model_parameter_stats(model: nn.Module) -> dict[str, Any]:
-    """
-    Tính toán chi tiết các chỉ số tham số mô hình:
-    - Tổng số tham số (total_params)
-    - Tham số có thể huấn luyện (trainable_params)
-    - Tham số đóng băng / non-trainable (non_trainable_params)
-    - Tỷ lệ tham số huấn luyện (trainable_ratio)
-    - Kích thước bộ nhớ ước tính (size_mb) ở định dạng FP32
-    - Thống kê chi tiết theo từng nhánh / module con (submodules)
-    """
+    """Tính toán chi tiết các chỉ số tham số mô hình."""
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable = total_params - trainable_params
@@ -144,7 +128,7 @@ def get_model_parameter_stats(model: nn.Module) -> dict[str, Any]:
 
 
 def format_parameter_summary(stats: dict[str, Any]) -> str:
-    """Định dạng kết quả kiểm toán tham số thành bảng ASCII trực quan."""
+    """Định dạng kết quả kiểm toán tham số thành bảng ASCII."""
     lines = [
         "=" * 78,
         f"{'BẢNG THỐNG KÊ THAM SỐ MÔ HÌNH (MODEL PARAMETER AUDIT)':^78}",
@@ -165,4 +149,3 @@ def format_parameter_summary(stats: dict[str, Any]) -> str:
     lines.append(f"  * Ước tính dung lượng bộ nhớ (FP32 weights): {stats.get('size_mb', 0.0):.2f} MB")
     lines.append("=" * 78)
     return "\n".join(lines)
-

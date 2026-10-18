@@ -1,0 +1,4216 @@
+==> ./sanity_check.py <==
+import argparse
+from pathlib import Path
+import sys
+
+ROOT_DIR = Path(__file__).resolve().parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+from tasdf.models.final_model import TASDFNet
+from tasdf.data import build_dataset
+from tasdf.utils import resolve_data_config
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Kiểm tra luồng chạy TASDFNet từ cấu hình")
+    parser.add_argument("--config", type=str, default="configs/coco_blastocyst.yaml", help="Đường dẫn file cấu hình YAML")
+    parser.add_argument("--data_dir", type=str, default=None, help="Ghi đè đường dẫn thư mục dữ liệu (tùy chọn)")
+    parser.add_argument("--output", type=str, default="visualize/img/model_output_sanity.png", help="Đường dẫn lưu ảnh")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.data_dir:
+        data_cfg = {"type": "folder", "path": args.data_dir, "image_size": 256}
+    else:
+        data_cfg = resolve_data_config(args.config)
+
+    dataset = build_dataset(data_cfg, split="train", is_labeled=False, is_train=False)
+    if len(dataset) == 0:
+        raise RuntimeError(f"Không tìm thấy ảnh nào trong cấu hình: {data_cfg}")
+
+    img_tensor = dataset[0].unsqueeze(0).to(device)
+    model = TASDFNet(in_channels=1, base_channels=64, num_classes=5, k_iters=10).to(device)
+    model.eval()
+
+    with torch.no_grad():
+        p1, t1 = model(img_tensor, branch="net1")
+        probs = F.softmax(p1, dim=1)
+
+    img_np = img_tensor.squeeze().cpu().numpy()
+    skeleton_np = t1[0].mean(dim=0).cpu().numpy()
+
+    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
+    axes[0].imshow(img_np, cmap="gray")
+    axes[0].set_title("1. Ảnh Phôi Đầu Vào")
+    axes[0].axis("off")
+
+    titles = ["2. Kênh ZP", "3. Kênh TE", "4. Kênh ICM", "5. Khung xương ITGM"]
+    cmaps = ["magma", "viridis", "plasma", "inferno"]
+    maps = [
+        probs[0, 1].cpu().numpy(),
+        probs[0, 2].cpu().numpy(),
+        probs[0, 3].cpu().numpy(),
+        skeleton_np,
+    ]
+
+    for idx in range(4):
+        axes[idx + 1].imshow(maps[idx], cmap=cmaps[idx])
+        axes[idx + 1].set_title(titles[idx])
+        axes[idx + 1].axis("off")
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    print(f">> Đã lưu ảnh kiểm tra tại: {out_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+==> ./tests/test_logger.py <==
+import json
+from pathlib import Path
+import pytest
+from tasdf.engine.logger import DualLogger
+
+
+def test_dual_logger_creates_files(tmp_path: Path):
+    logger = DualLogger(output_dir=tmp_path, exp_name="test_run")
+    assert (tmp_path / "train.log").exists()
+
+    logger.log_header()
+    logger.log_message("Khởi động thử nghiệm")
+
+    metrics_sample = {
+        "epoch": 1,
+        "total_epochs": 10,
+        "train_total_loss": 0.5432,
+        "train_loss_sup": 1.0864,
+        "train_loss_distill": 0.0050,
+        "val_mDice": 0.7850,
+        "per_class_dice": {
+            "Zona Pellucida (ZP)": 0.65,
+            "Trophectoderm (TE)": 0.75,
+            "Inner Cell Mass (ICM)": 0.50,
+            "Blastocyst Cavity (BC)": 1.0,
+        },
+    }
+
+    logger.log_epoch(metrics_sample)
+
+    assert (tmp_path / "metrics.json").exists()
+
+    # Kiểm tra tính đúng đắn của file JSON
+    with open(tmp_path / "metrics.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    assert len(data) == 1
+    assert data[0]["epoch"] == 1
+    assert data[0]["val_mDice"] == 0.7850
+    assert "timestamp" in data[0]
+
+    # Kiểm tra file train.log có chứa thông tin
+    with open(tmp_path / "train.log", "r", encoding="utf-8") as f:
+        log_content = f.read()
+
+    assert "01/10" in log_content
+    assert "78.50%" in log_content
+
+==> ./tests/conftest.py <==
+import json
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from tasdf.models import TASDFNet
+
+
+@pytest.fixture
+def dummy_model():
+    """Mô hình TASDFNet thu nhỏ để chạy test nhanh trên CPU."""
+    return TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=2)
+
+
+@pytest.fixture
+def dummy_batch():
+    """Tạo batch dữ liệu giả lập (ảnh + nhãn) cho bài toán phân vùng."""
+    x = torch.rand(2, 1, 32, 32)
+    y = torch.randint(0, 5, (2, 32, 32))
+    return x, y
+
+
+@pytest.fixture
+def dummy_loaders():
+    """DataLoaders có nhãn và không nhãn cho test vòng lặp huấn luyện."""
+    x_l = torch.rand(4, 1, 32, 32)
+    y_l = torch.randint(0, 5, (4, 32, 32))
+    x_u = torch.rand(4, 1, 32, 32)
+
+    l_ds = TensorDataset(x_l, y_l)
+    labeled_loader = DataLoader(l_ds, batch_size=2)
+    unlabeled_loader = DataLoader(x_u, batch_size=2)
+    return labeled_loader, unlabeled_loader
+
+
+@pytest.fixture
+def synthetic_coco_dir(tmp_path: Path) -> Path:
+    """Tạo bộ dữ liệu COCO chuẩn giả lập không phụ thuộc đường dẫn máy chủ."""
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "valid"
+    train_dir.mkdir(parents=True, exist_ok=True)
+    val_dir.mkdir(parents=True, exist_ok=True)
+
+    for i in range(4):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(train_dir / f"embryo_{i}.png")
+    for i in range(2):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(val_dir / f"val_embryo_{i}.png")
+
+    coco_data = {
+        "images": [{"id": i, "file_name": f"embryo_{i}.png", "width": 64, "height": 64} for i in range(4)],
+        "categories": [
+            {"id": 1, "name": "ZP"},
+            {"id": 2, "name": "TE"},
+            {"id": 3, "name": "ICM"},
+        ],
+        "annotations": [
+            {
+                "id": 1,
+                "image_id": 0,
+                "category_id": 1,
+                "segmentation": [[10, 10, 50, 10, 50, 50, 10, 50]],
+            }
+        ],
+    }
+    with open(train_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(coco_data, f)
+
+    val_data = coco_data.copy()
+    val_data["images"] = [{"id": i, "file_name": f"val_embryo_{i}.png", "width": 64, "height": 64} for i in range(2)]
+    with open(val_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(val_data, f)
+
+    return tmp_path
+
+==> ./tests/test_unet_blocks.py <==
+import pytest
+from tasdf.models.unet_blocks import DoubleConv, Down, Up
+import torch
+
+
+def test_double_conv_shape():
+
+    block = DoubleConv(in_channels=1, out_channels=64)
+    #x: batch 2, channels 1, H, W
+    x = torch.rand(2, 1, 256, 256)
+    out = block(x)
+
+
+    assert out.shape == (2,64,256,256), f"Shape Error {out.shape}"
+
+def test_douwn_block_shape_and_skip_connection():
+    up_block = Up(in_channels=256, out_channels=128)
+
+    x1 = torch.rand(2,256,64,64)
+    x2 = torch.rand(2,128,128,128)
+
+    out = up_block(x1,x2)
+
+    assert out.shape == (2,128,128,128), f"Shape error, {out.shape}"
+==> ./tests/test_coco_dataset.py <==
+import torch
+import pytest
+from tasdf.data.coco import COCOEmbryoDataset
+
+
+def test_coco_embryo_dataset_loading_and_rasterization(synthetic_coco_dir):
+    """Kiểm tra đọc dữ liệu COCO và giải thuật rasterize đa giác trên dữ liệu tổng hợp."""
+    dataset = COCOEmbryoDataset(root_dir=synthetic_coco_dir, split="train", size=64, is_labeled=True)
+
+    # 1. Kiểm tra số lượng ảnh
+    assert len(dataset) == 4
+
+    # 2. Kiểm tra mẫu đầu tiên
+    img, mask = dataset[0]
+
+    assert img.shape == (1, 64, 64)
+    assert img.min() >= 0.0 and img.max() <= 1.0
+    assert mask.dtype == torch.long
+
+    # 3. Kiểm tra nhãn
+    unique_classes = torch.unique(mask).tolist()
+    for c in unique_classes:
+        assert isinstance(c, int)
+
+==> ./tests/test_data_builder.py <==
+import json
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import pytest
+import torch
+
+from tasdf.data.builder import build_dataset, build_dataloaders
+
+
+@pytest.fixture
+def synthetic_coco_dir(tmp_path: Path) -> Path:
+    """Tạo bộ dữ liệu COCO giả lập trên thư mục tạm."""
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "valid"
+    train_dir.mkdir(parents=True)
+    val_dir.mkdir(parents=True)
+
+    # Tạo 4 ảnh train và 2 ảnh val
+    for i in range(4):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(train_dir / f"embryo_{i}.png")
+    for i in range(2):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(val_dir / f"val_embryo_{i}.png")
+
+    # Tạo annotations json
+    coco_data = {
+        "images": [{"id": i, "file_name": f"embryo_{i}.png", "width": 64, "height": 64} for i in range(4)],
+        "categories": [
+            {"id": 1, "name": "ZP"},
+            {"id": 2, "name": "TE"},
+            {"id": 3, "name": "ICM"},
+        ],
+        "annotations": [
+            {
+                "id": 1,
+                "image_id": 0,
+                "category_id": 1,
+                "segmentation": [[10, 10, 50, 10, 50, 50, 10, 50]],
+            }
+        ],
+    }
+    with open(train_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(coco_data, f)
+
+    val_data = coco_data.copy()
+    val_data["images"] = [{"id": i, "file_name": f"val_embryo_{i}.png", "width": 64, "height": 64} for i in range(2)]
+    with open(val_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(val_data, f)
+
+    return tmp_path
+
+
+def test_build_dataloaders_synthetic(synthetic_coco_dir: Path):
+    cfg = {
+        "format": "coco",
+        "path": str(synthetic_coco_dir),
+        "train": "train",
+        "val": "valid",
+        "image_size": 64,
+        "labeled_ratio": 0.5,
+    }
+
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(
+        cfg, batch_size=2, num_workers=0
+    )
+
+    assert len(labeled_loader.dataset) == 2
+    assert len(unlabeled_loader.dataset) == 2
+    assert len(val_loader.dataset) == 2
+
+    # Kiểm tra kích thước batch
+    x_l, y_l = next(iter(labeled_loader))
+    assert x_l.shape == (2, 1, 64, 64)
+    assert y_l.shape == (2, 64, 64)
+
+    x_u = next(iter(unlabeled_loader))
+    assert x_u.shape == (2, 1, 64, 64)
+
+==> ./tests/test_predictor.py <==
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import torch
+from tasdf.models import TASDFNet
+from tasdf.engine.predictor import Predictor
+
+
+def test_predictor_pure_inference(tmp_path: Path):
+    img_path = tmp_path / "sample.png"
+    Image.fromarray(np.uint8(np.random.rand(64, 64) * 255)).save(img_path)
+
+    model = TASDFNet(in_channels=1, base_channels=16, num_classes=4, k_iters=2)
+    predictor = Predictor(image_size=32, device=torch.device("cpu"), branch="ensemble")
+    res = predictor.predict(model, source=img_path, output_dir=tmp_path / "out", save=True)
+
+    assert len(res) == 1
+    assert res[0]["mask"].shape == (64, 64)
+==> ./tests/test_low_resource_split.py <==
+import json
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import pytest
+import torch
+
+from tasdf.data.builder import build_dataloaders
+
+
+@pytest.fixture
+def synthetic_partial_coco_dir(tmp_path: Path) -> Path:
+    """Tạo bộ dữ liệu COCO giả lập với đúng 2 ảnh có nhãn và 4 ảnh không nhãn."""
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "valid"
+    train_dir.mkdir(parents=True)
+    val_dir.mkdir(parents=True)
+
+    # 6 ảnh train (2 có nhãn, 4 không nhãn)
+    for i in range(6):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(train_dir / f"embryo_{i}.png")
+    for i in range(2):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(val_dir / f"val_embryo_{i}.png")
+
+    # Chỉ ghi nhãn cho image_id 0 và image_id 1
+    coco_train = {
+        "images": [{"id": i, "file_name": f"embryo_{i}.png", "width": 64, "height": 64} for i in range(6)],
+        "categories": [
+            {"id": 1, "name": "ZP"},
+            {"id": 2, "name": "TE"},
+            {"id": 3, "name": "ICM"},
+        ],
+        "annotations": [
+            {"id": 101, "image_id": 0, "category_id": 1, "segmentation": [[10, 10, 50, 10, 50, 50, 10, 50]]},
+            {"id": 102, "image_id": 1, "category_id": 2, "segmentation": [[20, 20, 40, 20, 40, 40, 20, 40]]},
+        ],
+    }
+    with open(train_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(coco_train, f)
+
+    coco_val = {
+        "images": [{"id": i, "file_name": f"val_embryo_{i}.png", "width": 64, "height": 64} for i in range(2)],
+        "categories": coco_train["categories"],
+        "annotations": [
+            {"id": 201, "image_id": 0, "category_id": 1, "segmentation": [[10, 10, 50, 10, 50, 50, 10, 50]]},
+        ],
+    }
+    with open(val_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(coco_val, f)
+
+    return tmp_path
+
+
+def test_builder_auto_detects_physical_unlabeled(synthetic_partial_coco_dir: Path):
+    """Kiểm tra build_dataloaders tự động nhận diện đúng 2 ảnh có nhãn và 4 ảnh không nhãn."""
+    cfg = {
+        "format": "coco",
+        "path": str(synthetic_partial_coco_dir),
+        "train": "train",
+        "val": "valid",
+        "image_size": 64,
+    }
+
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(
+        cfg, batch_size=2, num_workers=0
+    )
+
+    assert len(labeled_loader.dataset) == 2, f"Kỳ vọng 2 ảnh có nhãn, nhận {len(labeled_loader.dataset)}"
+    assert len(unlabeled_loader.dataset) == 4, f"Kỳ vọng 4 ảnh không nhãn, nhận {len(unlabeled_loader.dataset)}"
+
+    # Labeled loader phải trả về (x, y) với nhãn không rỗng
+    x_l, y_l = next(iter(labeled_loader))
+    assert x_l.shape == (2, 1, 64, 64)
+    assert y_l.shape == (2, 64, 64)
+    assert y_l.sum() > 0, "Mặt nạ nhãn không được rỗng toàn bộ!"
+
+    # Unlabeled loader phải trả về tensor ảnh duy nhất
+    x_u = next(iter(unlabeled_loader))
+    assert isinstance(x_u, torch.Tensor)
+    assert x_u.shape == (2, 1, 64, 64)
+
+
+def test_real_10p_dataset_integrity():
+    """Kiểm tra tính toàn vẹn của bộ dữ liệu 10% thực tế được sinh ra trên đĩa."""
+    dataset_dir = Path("/home/terminator/workspace/Attech/Research/dataset/Blast_Segment_10p_coco")
+    if not dataset_dir.exists():
+        pytest.skip("Chưa khởi tạo thư mục Blast_Segment_10p_coco")
+
+    train_ann_file = dataset_dir / "train" / "_annotations.coco.json"
+    assert train_ann_file.exists()
+
+    with open(train_ann_file, "r", encoding="utf-8") as f:
+        d = json.load(f)
+
+    images = d["images"]
+    annotations = d["annotations"]
+
+    assert len(images) == 621, f"Tổng số ảnh train phải là 621, nhận: {len(images)}"
+
+    # Tập hợp các image_id có nhãn
+    labeled_img_ids = set(a["image_id"] for a in annotations)
+    assert len(labeled_img_ids) == 62, f"Số ảnh có nhãn phải đúng 62 (10%), nhận: {len(labeled_img_ids)}"
+
+    # 559 ảnh còn lại phải hoàn toàn không có annotation
+    unlabeled_count = len(images) - len(labeled_img_ids)
+    assert unlabeled_count == 559
+
+    # Kiểm tra cấu trúc của 62 ảnh: Đảm bảo có đầy đủ 3 cấu trúc ZP, TE, ICM
+    img_structs = {}
+    for a in annotations:
+        cid = a["category_id"]
+        if cid in (7, 8, 9):
+            img_structs.setdefault(a["image_id"], set()).add("ZP")
+        elif cid in (4, 5, 6):
+            img_structs.setdefault(a["image_id"], set()).add("TE")
+        elif cid in (1, 2, 3):
+            img_structs.setdefault(a["image_id"], set()).add("ICM")
+
+    for iid in labeled_img_ids:
+        assert img_structs[iid] == {"ZP", "TE", "ICM"}, f"Ảnh {iid} không đủ cả 3 cấu trúc ZP, TE, ICM!"
+
+    # Kiểm tra DataLoader nạp chuẩn
+    cfg = {
+        "format": "coco",
+        "path": str(dataset_dir),
+        "train": "train",
+        "val": "valid",
+        "image_size": 64,
+    }
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(
+        cfg, batch_size=4, num_workers=0
+    )
+    assert len(labeled_loader.dataset) == 62
+    assert len(unlabeled_loader.dataset) == 559
+    assert len(val_loader.dataset) == 76
+
+==> ./tests/test_unet_backbone.py <==
+import torch
+import pytest
+from tasdf.models.unet_backbone import UNetBackbone
+
+
+def test_unet_backbone_shape():
+    """Kiểm tra kích thước tensor đầu ra của UNetBackbone."""
+    model = UNetBackbone(in_channels=1, base_channels=64)
+    model.eval()
+
+    # Thử nghiệm với Batch = 2 ảnh kích thước chuẩn 256x256
+    x = torch.randn(2, 1, 256, 256)
+    with torch.no_grad():
+        out = model(x)
+
+    # Đầu ra phải giữ nguyên kích thước không gian 256x256 và có 64 kênh đặc trưng
+    assert out.shape == (2, 64, 256, 256), f"Kích thước sai lệch: {out.shape}"
+
+
+def test_unet_backbone_gradient_flow():
+    """Kiểm tra dòng chảy gradient đảm bảo không tầng nào bị triệt tiêu đạo hàm."""
+    model = UNetBackbone(in_channels=1, base_channels=64)
+    model.train()
+
+    x = torch.randn(1, 1, 64, 64)  # Kích thước nhỏ để test nhanh
+    out = model(x)
+
+    # Giả lập hàm loss đơn giản
+    loss = out.sum()
+    loss.backward()
+
+    # Kiểm tra xem tầng đầu tiên (inc) có nhận được gradient hay không
+    first_conv_weight = model.inc.double_conv[0].weight
+    assert first_conv_weight.grad is not None, "Gradient không truyền về được tầng đầu tiên!"
+    assert torch.any(first_conv_weight.grad != 0), "Gradient bị triệt tiêu bằng 0!"
+==> ./tests/test_eval.py <==
+import numpy as np
+import pytest
+from tasdf.utils.metrics import compute_sample_metrics
+
+
+def test_compute_sample_metrics_identical():
+    # 1. Khi dự đoán trùng khớp hoàn toàn với nhãn chuẩn
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[10:30, 10:30] = 1  # ZP
+    mask[40:60, 40:60] = 2  # TE
+
+    metrics = compute_sample_metrics(mask, mask, num_classes=5)
+    assert metrics[1]["dice"] == pytest.approx(1.0, rel=1e-5)
+    assert metrics[1]["iou"] == pytest.approx(1.0, rel=1e-5)
+    assert metrics[2]["dice"] == pytest.approx(1.0, rel=1e-5)
+    assert metrics[2]["iou"] == pytest.approx(1.0, rel=1e-5)
+
+
+def test_compute_sample_metrics_disjoint():
+    # 2. Khi dự đoán hoàn toàn lệch pha với nhãn chuẩn
+    pred = np.zeros((100, 100), dtype=np.uint8)
+    target = np.zeros((100, 100), dtype=np.uint8)
+    pred[10:30, 10:30] = 1
+    target[50:70, 50:70] = 1
+
+    metrics = compute_sample_metrics(pred, target, num_classes=5)
+    assert metrics[1]["dice"] < 1e-4
+    assert metrics[1]["iou"] < 1e-4
+
+==> ./tests/test_inference.py <==
+import numpy as np
+import pytest
+from tasdf.utils.metrics import decompose_te_and_blastocoel
+
+
+def test_decompose_te_and_blastocoel():
+    # Tạo một mặt nạ giả lập: hình tròn bán kính 50 điểm ảnh mang Lớp 2 (TE)
+    h, w = 120, 120
+    mask = np.zeros((h, w), dtype=np.uint8)
+    y, x = np.ogrid[:h, :w]
+    circle = (x - 60) ** 2 + (y - 60) ** 2 <= 40 ** 2
+    mask[circle] = 2  # Lớp 2
+
+    # Đặt một khối ICM (Lớp 3) ở góc trong
+    icm_circle = (x - 50) ** 2 + (y - 50) ** 2 <= 10 ** 2
+    mask[icm_circle] = 3
+
+    # Phân rã
+    decomposed = decompose_te_and_blastocoel(mask, te_thickness_ratio=0.1)
+
+    unique_classes = set(np.unique(decomposed))
+    # Phải có cả 4 lớp: 0 (Nền), 2 (TE viền), 3 (ICM), 4 (Blastocoel lõi)
+    assert 0 in unique_classes
+    assert 2 in unique_classes
+    assert 3 in unique_classes
+    assert 4 in unique_classes
+
+==> ./tests/test_engine.py <==
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import pytest
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from tasdf.models import TASDFNet
+from tasdf.engine.validator import Validator
+from tasdf.engine.predictor import Predictor
+
+
+@pytest.fixture
+def dummy_model():
+    return TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=2)
+
+
+def test_validator_metrics(dummy_model):
+    x = torch.rand(2, 1, 32, 32)
+    y = torch.randint(0, 5, (2, 32, 32))
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+
+    validator = Validator(loader, device=torch.device("cpu"), num_classes=5)
+    res = validator.validate(dummy_model)
+
+    assert "mDice" in res
+    assert "mIoU" in res
+    assert 0.0 <= res["mDice"] <= 1.0
+
+
+def test_predictor_single_image(dummy_model, tmp_path: Path):
+    # Tạo 1 ảnh phôi giả lập
+    img_p = tmp_path / "test_embryo.png"
+    Image.fromarray(np.uint8(np.random.rand(64, 64) * 255)).save(img_p)
+
+    predictor = Predictor(image_size=32, device=torch.device("cpu"))
+    results = predictor.predict(dummy_model, source=img_p, output_dir=tmp_path / "preds", save=True)
+
+    assert len(results) == 1
+    assert results[0]["mask"].shape == (64, 64)
+    assert Path(results[0]["saved_paths"]["composite"]).exists()
+
+==> ./tests/test_itgm.py <==
+import pytest
+import torch
+
+from tasdf.models.itgm import ITGM
+
+
+def test_itgm_shape_and_range():
+
+    model = ITGM(iterations = 10, kernel_size = 3)
+
+    x = torch.rand(2,1,64,64)
+
+    output = model(x)
+
+    assert output.shape == (2,1,64,64), f"Shape false! Output{output.shape}"
+
+    assert output.min() >= 0.0, f"Negative soft skeleton values"
+    assert output.max() <= 1.0 + 1e-6, f"Value over 1.0"
+
+def test_itgm_gradient_flow():
+    """Check gradient can backprop through minpool/maxpool"""
+
+    model = ITGM(iterations = 1, kernel_size = 3)
+
+    x = torch.tensor(
+        [[[
+            [1.,2.,3.,4.],
+            [5.,6.,7.,8.],
+            [9.,0.,1.,2.],
+            [4.,5.,6.,7.]
+
+        ]]], 
+        requires_grad=True)
+
+    output = model(x)
+
+    loss = output.sum()
+    loss.backward()
+
+
+    assert x.grad is not None, f"Gradient does not backprop"
+    assert not torch.isnan(x.grad).any(), f"Gradient get NaN"
+    assert x.grad.abs().sum() > 0, (
+        "All values are 0"
+    )
+
+==> ./tests/test_losses.py <==
+import torch
+import pytest
+from tasdf.losses.losses import sigmoid_rampup, MainLoss
+
+
+
+
+def test_sigmoid_rampup():
+    """Test increase ability of Sigmoid Rampup"""
+
+    w_0 = sigmoid_rampup(current_epoch=0, max_epochs=100, alpha=1.0)
+    w_50 = sigmoid_rampup(current_epoch=50, max_epochs= 100, alpha=1.0)
+    w_100 = sigmoid_rampup(current_epoch=100, max_epochs= 100, alpha= 1.0)
+
+    assert w_0 < 0.01, f"w(0) too large: {w_0}"
+    assert w_0 < w_50 < w_100
+    assert pytest.approx(w_100, rel=1e-3) == 1.0
+
+def test_loss_values_and_gradient_flow():
+    """Test gradient backprop througt 3 loss component"""
+
+    criterion = MainLoss(lambda_topo=0.10, gamma= 0.5, alpha=1.0, max_epochs=100)
+
+    # Labeled Data
+    p1_l = torch.randn(2,5,32,32, requires_grad = True)
+    p2_l = torch.randn(2,5,32,32, requires_grad = True)
+    targets_l = torch.randint(0,5, (2,32,32), dtype=torch.long)
+
+    p1_u = torch.randn(2,5,32,32, requires_grad = True)
+    p2_u = torch.randn(2,5,32,32, requires_grad = True)
+    t1_u = torch.rand(2,1,32,32, requires_grad = True)
+    t2_u = torch.rand(2,1,32,32, requires_grad = True)
+
+    #Calculate at epoch 50
+    total_loss, metrics = criterion(
+        p1_l, p2_l, targets_l, 
+        p1_u, p2_u, t1_u, t2_u,
+        current_epoch = 50,
+    )
+
+    assert total_loss.item() > 0, "loss must be positive value"
+    assert "loss_sup" in metrics and "loss_pc" in metrics and "loss_tc" in metrics
+
+    #Gradient backprop
+
+    total_loss.backward()
+
+    for tensor, name in [
+        (p1_l, "p1_l"), (p2_l,"p2_l"),
+        (p1_u, "p1_u"), (p2_u, "p2_u"),
+        (t1_u, "t1_u"), (t2_u, "t2_u"),
+    ]:
+        assert tensor.grad is not None, f"Grad backprop not return to {name}"
+        assert torch.any(tensor.grad != 0), f"The gradient at {name} vanishes to zero."
+    
+==> ./tests/test_dual_heads.py <==
+import torch
+from tasdf.models.dual_heads import PixelHead, TopoHead, DualHeads
+
+
+def test_pixel_head_shape():
+    head = PixelHead(in_channels=64, num_classes=5)
+    f = torch.randn(2, 64, 128, 128)
+    p = head(f)
+    assert p.shape == (2, 5, 128, 128)
+
+
+def test_topo_head_shape_and_range():
+    head = TopoHead(in_channels=64, topo_channels=4, k_iters=5)
+    f = torch.randn(2, 64, 128, 128)
+    t = head(f)
+    assert t.shape == (2, 4, 128, 128)
+    assert t.min() >= 0.0 and t.max() <= 1.0
+
+
+def test_dual_heads_gradient_flow():
+    dual_heads = DualHeads(in_channels=64, num_classes=5, k_iters=5)
+    dual_heads.train()
+    f = torch.randn(1, 64, 64, 64, requires_grad=True)
+    p, t = dual_heads(f)
+    loss = p.sum() + t.sum()
+    loss.backward()
+    assert dual_heads.pixel_head.conv.weight.grad is not None
+    assert dual_heads.topo_head.proj.weight.grad is not None
+    assert f.grad is not None and torch.any(f.grad != 0)
+==> ./tests/test_builder.py <==
+import pytest
+from tasdf.data.builder import build_dataloaders
+
+
+def test_build_dataloaders_from_config(synthetic_coco_dir):
+    cfg = {
+        "format": "coco",
+        "path": str(synthetic_coco_dir),
+        "train": "train",
+        "val": "valid",
+        "image_size": 64,
+        "labeled_ratio": 0.5,
+    }
+
+    labeled_loader, unlabeled_loader, val_loader = build_dataloaders(cfg, batch_size=2, num_workers=0)
+
+    assert len(labeled_loader.dataset) == 2
+    assert len(unlabeled_loader.dataset) == 2
+    assert len(val_loader.dataset) == 2
+
+    # Lấy thử 1 batch từ unlabeled_loader để kiểm tra kích thước
+    x_u = next(iter(unlabeled_loader))
+    assert x_u.shape == (2, 1, 64, 64)
+
+==> ./tests/test_trainer.py <==
+from pathlib import Path
+import pytest
+import torch
+from torch.utils.data import DataLoader, TensorDataset
+
+from tasdf.models import TASDFNet
+from tasdf.engine.trainer import Trainer
+from tasdf.engine.logger import DualLogger
+
+
+@pytest.fixture
+def dummy_model():
+    return TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=2)
+
+
+@pytest.fixture
+def dummy_loaders():
+    x_l = torch.rand(4, 1, 32, 32)
+    y_l = torch.randint(0, 5, (4, 32, 32))
+    x_u = torch.rand(4, 1, 32, 32)
+
+    l_ds = TensorDataset(x_l, y_l)
+    u_ds = TensorDataset(x_u)
+
+    labeled_loader = DataLoader(l_ds, batch_size=2)
+    # unlabeled loader yields x_u (tensor directly)
+    unlabeled_loader = DataLoader(x_u, batch_size=2)
+    return labeled_loader, unlabeled_loader
+
+
+def test_trainer_one_epoch_and_checkpoint(dummy_model, dummy_loaders, tmp_path: Path):
+    l_loader, u_loader = dummy_loaders
+    cfg = {
+        "training": {
+            "device": "cpu",
+            "amp": False,
+            "learning_rate": 1e-3,
+            "accum_steps": 1,
+            "checkpoint_dir": str(tmp_path / "checkpoints"),
+        },
+        "loss": {"lambda_topo": 0.1, "gamma": 0.5, "alpha": 1.0, "max_epochs": 2},
+    }
+
+    logger = DualLogger(output_dir=tmp_path / "logs")
+    trainer = Trainer(dummy_model, cfg, logger=logger, checkpoint_dir=tmp_path / "checkpoints")
+
+    res = trainer.train_one_epoch(l_loader, u_loader, epoch=1)
+    assert res["total_loss"] > 0.0
+
+    # Test lưu checkpoint
+    trainer.save_checkpoint(epoch=1, is_best=True)
+    assert (tmp_path / "checkpoints" / "checkpoint_latest.pt").exists()
+    assert (tmp_path / "checkpoints" / "checkpoint_best.pt").exists()
+    assert (tmp_path / "checkpoints" / "best.pt").exists()
+    assert (tmp_path / "checkpoints" / "last.pt").exists()
+
+    # Test nạp lại checkpoint (Resume)
+    new_trainer = Trainer(dummy_model, cfg, logger=logger, checkpoint_dir=tmp_path / "checkpoints")
+    new_trainer.load_checkpoint(tmp_path / "checkpoints" / "last.pt", resume=True)
+    assert new_trainer.start_epoch == 2
+
+
+def test_trainer_exports_best_and_last_pt(dummy_model, dummy_loaders, tmp_path: Path):
+    """Kiểm tra chu trình huấn luyện luôn tạo ra chính xác best.pt và last.pt."""
+    l_loader, u_loader = dummy_loaders
+    root_ckpt = tmp_path / "global_checkpoints"
+    cfg = {
+        "training": {
+            "device": "cpu",
+            "amp": False,
+            "learning_rate": 1e-3,
+            "accum_steps": 1,
+            "epochs": 2,
+            "checkpoint_dir": str(root_ckpt),
+        },
+        "loss": {"lambda_topo": 0.1, "gamma": 0.5, "alpha": 1.0, "max_epochs": 2},
+    }
+
+    local_ckpt = tmp_path / "runs" / "exp" / "weights"
+    logger = DualLogger(output_dir=tmp_path / "runs" / "exp" / "logs")
+    trainer = Trainer(dummy_model, cfg, logger=logger, checkpoint_dir=local_ckpt)
+
+    results = trainer.train(l_loader, u_loader, epochs=2)
+
+    # 1. Kiểm tra file tại thư mục cục bộ của phiên chạy
+    assert (local_ckpt / "best.pt").exists()
+    assert (local_ckpt / "last.pt").exists()
+
+    # 2. Kiểm tra file được đồng bộ sang thư mục checkpoints cấu hình toàn cục
+    assert (root_ckpt / "best.pt").exists()
+    assert (root_ckpt / "last.pt").exists()
+
+    # 3. Kiểm tra kết quả trả về trong từ điển kết quả
+    assert results["best_checkpoint"] == str(local_ckpt / "best.pt")
+    assert results["last_checkpoint"] == str(local_ckpt / "last.pt")
+
+
+==> ./tests/test_final_model.py <==
+import torch
+import pytest
+from tasdf.models.final_model import TASDFSubNet, TASDFNet
+
+
+def test_tasdf_subnet_shape():
+    """Kiểm tra kích thước đầu ra của một nhánh mạng con TASDFSubNet."""
+    subnet = TASDFSubNet(in_channels=1, base_channels=16, num_classes=5, k_iters=3)
+    subnet.eval()
+    
+    x = torch.randn(2, 1, 64, 64)
+    with torch.no_grad():
+        p, t = subnet(x)
+        
+    assert p.shape == (2, 5, 64, 64), f"Shape Logits sai: {p.shape}"
+    assert t.shape == (2, 1, 64, 64), f"Shape Skeleton sai: {t.shape}"
+    assert t.min() >= 0.0 and t.max() <= 1.0, "Giá trị Skeleton vượt ngưỡng [0, 1]!"
+
+
+def test_tasdf_non_shared_weights():
+    """Đảm bảo net1 và net2 là hai thực thể độc lập trọng số (Non-Shared Weights)."""
+    model = TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=3)
+    
+    # Kiểm tra con trỏ vùng nhớ (memory pointer) không được trùng nhau
+    weight1 = model.net1.backbone.inc.double_conv[0].weight
+    weight2 = model.net2.backbone.inc.double_conv[0].weight
+    
+    assert weight1.data_ptr() != weight2.data_ptr(), "LỖI: Trọng số của 2 mạng bị chia sẻ (Shared Memory)!"
+
+
+def test_tasdf_forward_modes():
+    """Kiểm tra hoạt động của cả 4 chế độ forward: both, net1, net2, ensemble."""
+    model = TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=3)
+    model.eval()
+    x = torch.randn(1, 1, 64, 64)
+
+    with torch.no_grad():
+        # Mode 1: both
+        (p1, t1), (p2, t2) = model(x, branch="both")
+        assert p1.shape == (1, 5, 64, 64) and p2.shape == (1, 5, 64, 64)
+
+        # Mode 2: net1
+        p_n1, t_n1 = model(x, branch="net1")
+        assert p_n1.shape == (1, 5, 64, 64)
+
+        # Mode 3: net2
+        p_n2, t_n2 = model(x, branch="net2")
+        assert p_n2.shape == (1, 5, 64, 64)
+
+        # Mode 4: ensemble
+        p_ens, t_ens = model(x, branch="ensemble")
+        assert p_ens.shape == (1, 5, 64, 64)
+
+
+def test_tasdf_end_to_end_gradients():
+    """Kiểm tra truyền ngược gradient toàn diện cho cả 2 mạng song sinh."""
+    model = TASDFNet(in_channels=1, base_channels=16, num_classes=5, k_iters=3)
+    model.train()
+
+    x = torch.randn(1, 1, 64, 64)
+    (p1, t1), (p2, t2) = model(x, branch="both")
+
+    # Giả lập hàm mất mát tổng hợp từ cả 2 mạng
+    loss = p1.sum() + t1.sum() + p2.sum() + t2.sum()
+    loss.backward()
+
+    # Kiểm tra gradient đã truyền đến tận tầng đầu của net1 và net2
+    grad1 = model.net1.backbone.inc.double_conv[0].weight.grad
+    grad2 = model.net2.backbone.inc.double_conv[0].weight.grad
+
+    assert grad1 is not None and torch.any(grad1 != 0), "Gradient không truyền về net1!"
+    assert grad2 is not None and torch.any(grad2 != 0), "Gradient không truyền về net2!"
+==> ./tests/test_api.py <==
+import json
+from pathlib import Path
+from PIL import Image
+import numpy as np
+import pytest
+import torch
+
+from tasdf import TASDF
+
+
+@pytest.fixture
+def api_synthetic_coco(tmp_path: Path) -> Path:
+    train_dir = tmp_path / "train"
+    val_dir = tmp_path / "valid"
+    train_dir.mkdir(parents=True)
+    val_dir.mkdir(parents=True)
+
+    for i in range(4):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(train_dir / f"embryo_{i}.png")
+    for i in range(2):
+        img = Image.fromarray(np.uint8(np.random.rand(64, 64) * 255))
+        img.save(val_dir / f"val_embryo_{i}.png")
+
+    coco_data = {
+        "images": [{"id": i, "file_name": f"embryo_{i}.png", "width": 64, "height": 64} for i in range(4)],
+        "categories": [
+            {"id": 1, "name": "ZP"},
+            {"id": 2, "name": "TE"},
+            {"id": 3, "name": "ICM"},
+        ],
+        "annotations": [
+            {
+                "id": 1,
+                "image_id": 0,
+                "category_id": 1,
+                "segmentation": [[10, 10, 50, 10, 50, 50, 10, 50]],
+            }
+        ],
+    }
+    with open(train_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(coco_data, f)
+
+    val_data = coco_data.copy()
+    val_data["images"] = [{"id": i, "file_name": f"val_embryo_{i}.png", "width": 64, "height": 64} for i in range(2)]
+    with open(val_dir / "_annotations.coco.json", "w", encoding="utf-8") as f:
+        json.dump(val_data, f)
+
+    return tmp_path
+
+
+def test_api_workflow_jupyter_style(api_synthetic_coco: Path, tmp_path: Path):
+    data_dict = {
+        "format": "coco",
+        "path": str(api_synthetic_coco),
+        "train": "train",
+        "val": "valid",
+        "names": {1: "ZP", 2: "TE", 3: "ICM"},
+    }
+
+    # 1. Khởi tạo mô hình
+    model = TASDF(model={"model": {"base_channels": 16, "k_iters": 2}})
+    assert model.model is not None
+
+    # 2. Huấn luyện 1 epoch với API gọn gàng
+    runs_dir = tmp_path / "runs"
+    results = model.train(
+        data=data_dict,
+        epochs=1,
+        batch=2,
+        imgsz=32,
+        num_workers=0,
+        project=str(runs_dir),
+        name="test_exp",
+    )
+
+    exp_dir = Path(results["exp_dir"])
+    assert exp_dir.exists()
+    assert (exp_dir / "train.log").exists()
+    assert (exp_dir / "metrics.json").exists()
+    assert (exp_dir / "checkpoints" / "latest.pt").exists()
+    assert (exp_dir / "checkpoints" / "best.pt").exists()
+    assert (exp_dir / "checkpoints" / "last.pt").exists()
+
+    # 3. Đánh giá (Val)
+    val_res = model.val(data=data_dict, imgsz=32, batch=2)
+    assert "mDice" in val_res
+    assert "mIoU" in val_res
+
+    # Kiểm tra log file đã ghi nhận bảng đo lường tham số trước epoch 1
+    log_content = (exp_dir / "train.log").read_text(encoding="utf-8")
+    assert "MODEL PARAMETER AUDIT" in log_content
+    assert "net1" in log_content
+    assert "net2" in log_content
+
+    # 4. Suy luận trực quan (Predict)
+    dummy_img = api_synthetic_coco / "train" / "embryo_0.png"
+    preds = model.predict(source=dummy_img, imgsz=32, save=True, output_dir=runs_dir / "preds")
+    assert len(preds) == 1
+    assert "mask" in preds[0]
+    assert Path(preds[0]["saved_paths"]["composite"]).exists()
+
+
+def test_model_parameter_audit():
+    """Kiểm tra độ chính xác của hàm đo lường và hiển thị tham số mô hình."""
+    from tasdf.utils import get_model_parameter_stats, format_parameter_summary
+
+    model = TASDF(model={"model": {"base_channels": 16, "k_iters": 2}})
+    stats = model.info(detailed=False)
+
+    assert isinstance(stats, dict)
+    assert stats["total_params"] > 0
+    assert stats["trainable_params"] == stats["total_params"]
+    assert stats["non_trainable_params"] == 0
+    assert stats["trainable_ratio"] == 100.0
+    assert stats["size_mb"] > 0.0
+
+    assert "net1" in stats["submodules"]
+    assert "net2" in stats["submodules"]
+    assert stats["submodules"]["net1"]["total_params"] == stats["submodules"]["net2"]["total_params"]
+    assert stats["submodules"]["net1"]["total_params"] * 2 == stats["total_params"]
+
+    table_str = format_parameter_summary(stats)
+    assert "MODEL PARAMETER AUDIT" in table_str
+    assert "TỔNG CỘNG (TOTAL)" in table_str
+    assert "net1" in table_str
+
+
+==> ./visualize/trace_unet_blocks.py <==
+from pathlib import Path
+import sys
+
+# Định vị thư mục gốc để import module chuẩn xác
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+  sys.path.insert(0, str(ROOT_DIR))
+
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+from tasdf.models.unet_blocks import DoubleConv, Down, Up
+import torch
+
+
+def load_real_embryo(image_path: str, size: int = 256) -> torch.Tensor:
+  img = Image.open(image_path).convert('L').resize((size, size))
+  img_np = np.array(img, dtype=np.float32) / 255.0
+  return torch.tensor(img_np).unsqueeze(0).unsqueeze(0)
+
+
+def main():
+  image_path = '/home/terminator/workspace/Attech/Research/dataset/ICM Blastocyst/Blast_PCRM_R13-0073A.png'
+
+  print('=' * 75)
+  print(' KIỂM TRA DÒNG CHẢY DỮ LIỆU CỦA ẢNH PHÔI THẬT QUA CÁC KHỐI U-NET ')
+  print('=' * 75)
+
+  # 1. Nạp ảnh thật
+  x0 = load_real_embryo(image_path, size=256)
+  print(
+      f'0. Ảnh Phôi Gốc       | Shape: {list(x0.shape)} |'
+      ' [Batch=1, Kênh=1, 256x256]'
+  )
+
+  # 2. Khởi tạo 3 khối
+  conv1 = DoubleConv(in_channels=1, out_channels=64)
+  down1 = Down(in_channels=64, out_channels=128)
+  up1 = Up(in_channels=128, out_channels=64)
+
+  # 3. Chạy qua DoubleConv
+  x1 = conv1(x0)
+  print(
+      f'1. Sau DoubleConv(1->64)| Shape: {list(x1.shape)} | Giữ nguyên 256x256,'
+      ' trích 64 kênh đặc trưng'
+  )
+
+  # 4. Chạy qua Down (Co hẹp 1/2)
+  x2 = down1(x1)
+  print(
+      f'2. Sau Down(64->128)   | Shape: {list(x2.shape)} | Thu nhỏ 1/2 thành'
+      ' 128x128, tăng lên 128 kênh'
+  )
+
+  # 5. Chạy qua Up (Giãn x2 và ghép với x1)
+  x_up = up1(x2, x1)
+  print(
+      f'3. Sau Up(128->64)     | Shape: {list(x_up.shape)} | Khôi phục 256x256'
+      ' nhờ Skip Connection!'
+  )
+
+  print('=' * 75)
+  print('>> Đang vẽ biểu đồ trực quan hóa đặc trưng ra file unet_trace.png...')
+
+  # Vẽ minh họa dòng chảy thị giác
+  fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+
+  # Ảnh gốc
+  axes[0].imshow(x0.squeeze().detach().numpy(), cmap='gray')
+  axes[0].set_title(
+      f'Ảnh Gốc\nShape: {list(x0.shape)[1:]}', fontsize=11, fontweight='bold'
+  )
+  axes[0].axis('off')
+
+  # 1 kênh bất kỳ sau DoubleConv (xem mạng trích viền màng ZP thế nào)
+  feature_conv1 = x1[0, 0].detach().numpy()
+  axes[1].imshow(feature_conv1, cmap='viridis')
+  axes[1].set_title(
+      f'Sau DoubleConv (Kênh 0)\nShape: {list(x1.shape)[1:]}', fontsize=11
+  )
+  axes[1].axis('off')
+
+  # 1 kênh sau Down (ảnh bị nén 1/2 độ phân giải)
+  feature_down1 = x2[0, 0].detach().numpy()
+  axes[2].imshow(feature_down1, cmap='plasma')
+  axes[2].set_title(
+      f'Sau Down (Thu nhỏ 1/2)\nShape: {list(x2.shape)[1:]}', fontsize=11
+  )
+  axes[2].axis('off')
+
+  # 1 kênh sau Up (đã khôi phục lại độ phân giải 256x256)
+  feature_up1 = x_up[0, 0].detach().numpy()
+  axes[3].imshow(feature_up1, cmap='inferno')
+  axes[3].set_title(f'Sau Up (Phóng to 256)\nShape: {list(x_up.shape)[1:]}', fontsize=11)
+  axes[3].axis('off')
+
+  plt.tight_layout()
+  plt.savefig('visualize/img/unet_trace.png', dpi=150)
+  print(">> XONG! Mở file 'unet_trace.png' để tận mắt chiêm ngưỡng!")
+
+
+if __name__ == '__main__':
+  main()
+==> ./visualize/visualize_itgm.py <==
+import matplotlib.pyplot as plt
+import numpy as np
+from PIL import Image
+import torch
+from tasdf.models.itgm import ITGM
+
+
+def load_real_embryo(image_path: str, size: int = 256) -> torch.Tensor:
+    """Nạp ảnh phôi thật từ đĩa, chuẩn hóa và chuyển thành Tensor PyTorch (1, 1, H,
+
+    W)
+    """
+    # 1. Đọc ảnh và chuyển sang ảnh xám 1 channel ('L' = Luminance/Grayscale)
+    img = Image.open(image_path).convert("L")
+
+    # 2. Resize về kích thước 256x256 chuẩn của bài báo TASDF
+    img = img.resize((size, size))
+
+    # 3. Chuẩn hóa pixel từ [0, 255] về số thực [0.0, 1.0]
+    img_np = np.array(img, dtype=np.float32) / 255.0
+
+    # 4. Thêm chiều Batch (B=1) và chiều Channel (C=1)
+    tensor = torch.tensor(img_np).unsqueeze(0).unsqueeze(0)
+    return tensor
+
+
+def main():
+    # Đường dẫn đến file ảnh phôi thật trên máy của bạn
+    image_path = "/home/terminator/workspace/Attech/Research/dataset/ICM Blastocyst/Blast_PCRM_R13-0073A.png"
+
+    print("=" * 65)
+    print(f">> Đang nạp ảnh phôi thật từ: {image_path}")
+    embryo_tensor = load_real_embryo(image_path, size=256)
+    print(f">> Tensor kích thước: {embryo_tensor.shape}, Kiểu: {embryo_tensor.dtype}")
+    print("=" * 65)
+
+    # Khởi tạo mô hình ITGM
+    model = ITGM(iterations=10, kernel_size=3)
+
+    # Chạy forward pass
+    final_skeleton, history = model(embryo_tensor, return_intermediates=True)
+
+    # In thông số định lượng qua từng vòng lặp
+    print(
+        f"{'Bước':<8} | {'Số pixel tế bào (Eroded)':<25} | {'Số pixel Xương tích lũy':<25}"
+    )
+    print("-" * 65)
+    for item in history:
+        step = item["step"]
+        eroded_pixels = (item["f_eroded"] > 0.1).sum().item()
+        skel_pixels = (item["accumulated_skeleton"] > 0.1).sum().item()
+        print(f"Bước {step:<3} | {eroded_pixels:<25} | {skel_pixels:<25}")
+
+    print("=" * 65)
+    print(">> Đang lưu biểu đồ trực quan ra 'real_embryo_itgm_steps.png'...")
+
+    # Vẽ biểu đồ 3 hàng x 4 cột hiển thị quá trình gọt giũa ảnh thật
+    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    axes = axes.flatten()
+
+    # Hình 0: Ảnh kính hiển vi gốc
+    axes[0].imshow(embryo_tensor.squeeze().numpy(), cmap="gray")
+    axes[0].set_title(
+        "Ảnh Kính Hiển Vi Thật (HMC)", fontsize=11, fontweight="bold"
+    )
+    axes[0].axis("off")
+
+    # Các hình tiếp theo: Khung xương tích lũy qua từng bước (Step 0 đến 10)
+    for i, item in enumerate(history):
+        ax = axes[i + 1]
+        skel_img = item["accumulated_skeleton"].squeeze().numpy()
+        ax.imshow(skel_img, cmap="magma")
+        ax.set_title(f"Khung xương Bước {item['step']}", fontsize=11)
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig("visualize/img/real_embryo_itgm_steps.png", dpi=150)
+    print(
+        ">> THÀNH CÔNG! Hãy mở file 'real_embryo_itgm_steps.png' để xem kết quả!"
+    )
+
+
+if __name__ == "__main__":
+    main()
+==> ./eval.py <==
+"""
+eval.py - CLI entrypoint for evaluating TASDF models.
+Thin wrapper delegating directly to the high-level TASDF facade API.
+"""
+import argparse
+import json
+from pathlib import Path
+from tasdf import TASDF
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TASDF Evaluation CLI")
+    parser.add_argument("--config", type=str, default="configs/coco_blastocyst.yaml", help="Path to YAML config")
+    parser.add_argument("--weights", type=str, required=True, help="Path to checkpoint (.pt)")
+    parser.add_argument("--split", type=str, default="val", choices=["val", "valid", "test", "train"], help="Split to evaluate")
+    parser.add_argument("--branch", type=str, default="net1", choices=["net1", "net2", "ensemble"], help="Evaluation branch")
+    parser.add_argument("--imgsz", type=int, default=256, help="Image size")
+    parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
+    parser.add_argument("--save_json", type=str, default=None, help="Optional path to save metrics JSON")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    model = TASDF(model=args.weights)
+    results = model.val(
+        data=args.config,
+        split=args.split,
+        imgsz=args.imgsz,
+        device=args.device,
+        branch=args.branch,
+    )
+    if args.save_json:
+        out_p = Path(args.save_json)
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_p, "w", encoding="utf-8") as f:
+            json.dump(results, f, indent=2)
+        print(f">> Chỉ số đánh giá đã lưu tại: {out_p.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+
+==> ./scripts/create_low_resource_coco.py <==
+#!/usr/bin/env python3
+"""
+create_low_resource_coco.py
+Công cụ tách lọc và tạo bộ dữ liệu COCO bán giám sát độc lập (Frozen Low-Resource Dataset).
+- Giữ nguyên 100% ảnh đầu vào trong tập train.
+- Giữ lại đúng 10% nhãn cho các ảnh đạt độ hoàn thiện cao nhất (ưu tiên đủ 3 cấu trúc ZP, TE, ICM).
+- Tước bỏ toàn bộ nhãn của 90% ảnh còn lại để tạo dữ liệu không nhãn thuần túy.
+- Giữ nguyên 100% tập valid và test.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import random
+import shutil
+
+
+def link_or_copy(src: Path, dst: Path, mode: str = "hardlink"):
+    """Tạo hardlink hoặc copy file an toàn."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    if mode == "hardlink":
+        try:
+            os.link(src, dst)
+            return
+        except OSError:
+            pass
+    shutil.copy2(src, dst)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Create Frozen Low-Resource COCO Dataset")
+    parser.add_argument(
+        "--src",
+        type=str,
+        default="/home/terminator/workspace/Attech/Research/dataset/Blast Segment.v15i.coco-segmentation",
+        help="Source COCO dataset directory",
+    )
+    parser.add_argument(
+        "--dst",
+        type=str,
+        default="/home/terminator/workspace/Attech/Research/dataset/Blast_Segment_10p_coco",
+        help="Destination directory for the filtered dataset",
+    )
+    parser.add_argument(
+        "--ratio",
+        type=float,
+        default=0.10,
+        help="Ratio of images to keep labeled (default: 0.10 for 10 percent)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible stratified selection",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="hardlink",
+        choices=["hardlink", "copy"],
+        help="File transfer mode for images (hardlink or copy)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    src_dir = Path(args.src)
+    dst_dir = Path(args.dst)
+
+    if not src_dir.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục nguồn: {src_dir}")
+
+    print("=" * 75)
+    print(" KHỞI TẠO BỘ DỮ LIỆU BÁN GIÁM SÁT 10% NHÃN (TASDF LOW-LABEL DATASET) ")
+    print("=" * 75)
+    print(f">> Nguồn:      {src_dir}")
+    print(f">> Đích:       {dst_dir}")
+    print(f">> Tỷ lệ nhãn: {args.ratio * 100:.1f}%")
+    print(f">> Seed:       {args.seed}")
+    print(f">> Chế độ:     {args.mode}")
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Xử lý tập TRAIN
+    train_src = src_dir / "train"
+    train_dst = dst_dir / "train"
+    train_dst.mkdir(parents=True, exist_ok=True)
+
+    ann_src_file = train_src / "_annotations.coco.json"
+    if not ann_src_file.exists():
+        ann_src_file = train_src / "annotations.json"
+    if not ann_src_file.exists():
+        raise FileNotFoundError(f"Không tìm thấy file annotation trong {train_src}")
+
+    with open(ann_src_file, "r", encoding="utf-8") as f:
+        coco_data = json.load(f)
+
+    images = coco_data.get("images", [])
+    annotations = coco_data.get("annotations", [])
+    categories = coco_data.get("categories", [])
+
+    total_images = len(images)
+    num_labeled = max(1, round(total_images * args.ratio))
+    print(f"\n[+] Phân tích tập train: Tổng số ảnh = {total_images} | Số ảnh giữ nhãn = {num_labeled}")
+
+    # Nhóm danh mục nhãn theo 3 cấu trúc sinh học chính:
+    # ZP: 7, 8, 9 | TE: 4, 5, 6 | ICM: 1, 2, 3
+    img_to_structs = {}
+    img_to_anns = {}
+    for ann in annotations:
+        iid = ann["image_id"]
+        cid = ann["category_id"]
+        img_to_anns.setdefault(iid, []).append(ann)
+
+        struct = None
+        if cid in (7, 8, 9):
+            struct = "ZP"
+        elif cid in (4, 5, 6):
+            struct = "TE"
+        elif cid in (1, 2, 3):
+            struct = "ICM"
+        if struct:
+            img_to_structs.setdefault(iid, set()).add(struct)
+
+    # Phân tầng ưu tiên ảnh có đủ cả 3 cấu trúc
+    tier_full = [img["id"] for img in images if img_to_structs.get(img["id"], set()) == {"ZP", "TE", "ICM"}]
+    tier_partial = [img["id"] for img in images if img["id"] not in tier_full and len(img_to_structs.get(img["id"], set())) > 0]
+    tier_empty = [img["id"] for img in images if img["id"] not in tier_full and img["id"] not in tier_partial]
+
+    print(f"    - Ảnh có đủ cả 3 cấu trúc (ZP + TE + ICM): {len(tier_full)}")
+    print(f"    - Ảnh có một phần cấu trúc:                 {len(tier_partial)}")
+    print(f"    - Ảnh không có cấu trúc nào:               {len(tier_empty)}")
+
+    # Lựa chọn xác định theo seed
+    rng = random.Random(args.seed)
+    # Sắp xếp trước khi shuffle để đảm bảo tính tất định trên mọi hệ điều hành
+    tier_full.sort()
+    rng.shuffle(tier_full)
+
+    if len(tier_full) >= num_labeled:
+        selected_labeled_ids = set(tier_full[:num_labeled])
+    else:
+        tier_partial.sort()
+        rng.shuffle(tier_partial)
+        needed = num_labeled - len(tier_full)
+        selected_labeled_ids = set(tier_full + tier_partial[:needed])
+
+    # Lọc lại annotations: Chỉ giữ annotations của ảnh được chọn
+    filtered_annotations = [ann for ann in annotations if ann["image_id"] in selected_labeled_ids]
+
+    # Kiểm toán annotations giữ lại
+    from collections import Counter
+    kept_cat_counts = Counter(ann["category_id"] for ann in filtered_annotations)
+    cats_by_id = {c["id"]: c["name"] for c in categories}
+
+    print(f"\n[+] Đã chọn lọc thành công {len(selected_labeled_ids)} ảnh có nhãn:")
+    for cid in sorted(kept_cat_counts.keys()):
+        print(f"    - Lớp {cid} ({cats_by_id.get(cid, 'Unknown')}): {kept_cat_counts[cid]} annotations")
+
+    # Tạo tệp _annotations.coco.json mới cho tập train
+    new_coco_train = {
+        "info": coco_data.get("info", {}),
+        "licenses": coco_data.get("licenses", []),
+        "categories": categories,
+        "images": images,  # Giữ nguyên 100% ảnh
+        "annotations": filtered_annotations,  # Chỉ còn nhãn của 10% ảnh
+    }
+
+    train_dst_ann = train_dst / "_annotations.coco.json"
+    with open(train_dst_ann, "w", encoding="utf-8") as f:
+        json.dump(new_coco_train, f, indent=2)
+
+    # Chuyển ảnh train
+    print(f"\n[+] Sao chép/liên kết {len(images)} ảnh tập train sang {train_dst}...")
+    for img in images:
+        f_name = img["file_name"]
+        src_img = train_src / f_name
+        dst_img = train_dst / f_name
+        if src_img.exists():
+            link_or_copy(src_img, dst_img, mode=args.mode)
+
+    # 2. Xử lý tập VALID và TEST (Giữ nguyên 100% để đánh giá khách quan)
+    for split in ["valid", "test"]:
+        split_src = src_dir / split
+        split_dst = dst_dir / split
+        if not split_src.exists():
+            continue
+        split_dst.mkdir(parents=True, exist_ok=True)
+        print(f"\n[+] Đồng bộ nguyên vẹn tập '{split}' (100% nhãn để làm chuẩn đối chứng)...")
+
+        # Copy file annotation
+        for ann_name in ["_annotations.coco.json", "annotations.json"]:
+            if (split_src / ann_name).exists():
+                shutil.copy2(split_src / ann_name, split_dst / ann_name)
+
+        # Chuyển ảnh
+        for f in split_src.glob("*"):
+            if f.is_file() and f.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+                link_or_copy(f, split_dst / f.name, mode=args.mode)
+
+    print("\n" + "=" * 75)
+    print(" BÁO CÁO HOÀN TẤT BỘ DỮ LIỆU ĐỘC LẬP ")
+    print("=" * 75)
+    print(f">> Tổng số ảnh Train:       {len(images)}")
+    print(f">> Số ảnh Có Nhãn (10%):    {len(selected_labeled_ids)} ({len(filtered_annotations)} annotations)")
+    print(f">> Số ảnh Không Nhãn (90%): {len(images) - len(selected_labeled_ids)} (0 annotations - zero leakage)")
+    print(f">> Thư mục sẵn sàng tại:    {dst_dir.resolve()}")
+    print("=" * 75)
+
+
+if __name__ == "__main__":
+    main()
+
+==> ./scripts/prepare_folder_dataset.py <==
+#!/usr/bin/env python3
+"""
+scripts/prepare_folder_dataset.py
+Công cụ chuẩn hóa bộ dữ liệu phôi nang từ:
+  1. Thư mục chứa các file nhãn COCO (.json) + Thư mục chứa toàn bộ ảnh gốc
+  2. Hoặc thư mục chứa ảnh mask rời (.png, .bmp, .tif)
+Sang cấu trúc chuẩn của FolderEmbryoDataset:
+  output_dir/
+    ├── train/
+    │   ├── images/ (100% ảnh train)
+    │   └── masks/  (Chỉ chứa mask .png cho đúng tỷ lệ labeled_ratio, VD: 10%)
+    ├── valid/
+    │   ├── images/ (100% ảnh valid)
+    │   └── masks/  (100% mask .png để đánh giá)
+    └── test/ (nếu có)
+"""
+import argparse
+import json
+import random
+from pathlib import Path
+import cv2
+import numpy as np
+from PIL import Image
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Chuẩn hóa dữ liệu COCO JSON / Mask PNG sang FolderEmbryoDataset")
+    parser.add_argument("--raw_images", type=str, required=True, help="Thư mục chứa toàn bộ ảnh gốc")
+    parser.add_argument(
+        "--raw_masks",
+        type=str,
+        required=True,
+        help="Thư mục chứa các file _annotations.coco.json (hoặc chứa các file ảnh mask .png)",
+    )
+    parser.add_argument("--output_dir", type=str, required=True, help="Thư mục xuất dữ liệu đầu ra")
+    parser.add_argument("--labeled_ratio", type=float, default=0.10, help="Tỷ lệ giữ nhãn tập train (mặc định: 0.10)")
+    parser.add_argument("--val_ratio", type=float, default=0.15, help="Tỷ lệ tách tập valid nếu không chia sẵn theo JSON")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed cố định")
+    return parser.parse_args()
+
+
+def map_category_to_class_id(cat_name: str, cat_id: int) -> int:
+    """Ánh xạ tên lớp hoặc ID trong COCO JSON về chuẩn [1: ZP, 2: TE, 3: ICM, 4: BC]."""
+    name_upper = cat_name.upper()
+    if "ZP" in name_upper or "ZONA" in name_upper:
+        return 1
+    if "TE" in name_upper or "TROPHECTODERM" in name_upper:
+        return 2
+    if "ICM" in name_upper or "INNER" in name_upper:
+        return 3
+    if any(k in name_upper for k in ("BC", "BLASTOCOEL", "CAVITY", "BLASTOCYST")):
+        return 4
+
+    # Fallback theo nhóm category_id của bộ dữ liệu Roboflow nếu tên bị khuyết
+    if cat_id in (7, 8, 9):
+        return 1
+    if cat_id in (4, 5, 6):
+        return 2
+    if cat_id in (1, 2, 3):
+        return 3
+    return 0
+
+
+def index_coco_jsons(mask_root: Path) -> dict[str, dict]:
+    """
+    Quét tất cả các file .json trong mask_root và lập chỉ mục theo file_name và stem.
+    """
+    json_files = sorted(mask_root.rglob("*.json"))
+    coco_index: dict[str, dict] = {}
+
+    if not json_files:
+        return coco_index
+
+    print(f"[+] Phát hiện {len(json_files)} tệp JSON trong '{mask_root}':")
+    for jf in json_files:
+        print(f"    - {jf.relative_to(mask_root)}")
+        with open(jf, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # Nhận diện gợi ý split từ đường dẫn hoặc tên file JSON
+        path_lower = str(jf.relative_to(mask_root)).lower()
+        if "val" in path_lower:
+            split_hint = "valid"
+        elif "test" in path_lower:
+            split_hint = "test"
+        elif "train" in path_lower:
+            split_hint = "train"
+        else:
+            split_hint = "unknown"
+
+        cats = {c["id"]: c["name"] for c in data.get("categories", [])}
+        img_id_to_anns: dict[int, list] = {}
+        for ann in data.get("annotations", []):
+            if ann.get("segmentation"):
+                img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
+
+        for img_info in data.get("images", []):
+            fname = img_info["file_name"]
+            stem = Path(fname).stem
+            anns = img_id_to_anns.get(img_info["id"], [])
+
+            record = {
+                "width": img_info.get("width"),
+                "height": img_info.get("height"),
+                "anns": anns,
+                "cats": cats,
+                "split_hint": split_hint,
+            }
+            # Lưu chỉ mục theo cả tên file đầy đủ, stem, và tiền tố trước '.rf.' (Roboflow)
+            coco_index[fname] = record
+            coco_index[stem] = record
+            if ".rf." in stem:
+                coco_index[stem.split(".rf.")[0]] = record
+
+    return coco_index
+
+
+def rasterize_coco_record(record: dict, target_size: tuple[int, int]) -> tuple[np.ndarray | None, set[int]]:
+    """Vẽ mặt nạ đa lớp từ bản ghi COCO JSON."""
+    anns = record.get("anns", [])
+    if not anns:
+        return None, set()
+
+    target_w, target_h = target_size
+    orig_w = record.get("width") or target_w
+    orig_h = record.get("height") or target_h
+    cats = record.get("cats", {})
+
+    mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+    present_classes: set[int] = set()
+
+    def draw_priority(ann):
+        cname = cats.get(ann["category_id"], "")
+        cid = map_category_to_class_id(cname, ann["category_id"])
+        return {4: 0, 1: 1, 2: 2, 3: 3}.get(cid, 0)
+
+    for ann in sorted(anns, key=draw_priority):
+        cname = cats.get(ann["category_id"], "")
+        class_id = map_category_to_class_id(cname, ann["category_id"])
+        if class_id <= 0:
+            continue
+        for seg in ann.get("segmentation", []):
+            if isinstance(seg, list) and len(seg) >= 6:
+                poly = np.array(seg, dtype=np.int32).reshape(-1, 2)
+                cv2.fillPoly(mask, [poly], color=class_id)
+                present_classes.add(class_id)
+
+    if not present_classes:
+        return None, set()
+
+    if (orig_w, orig_h) != (target_w, target_h):
+        mask = cv2.resize(mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+    return mask, present_classes
+
+
+def find_png_mask(mask_root: Path, stem: str, target_size: tuple[int, int]) -> tuple[np.ndarray | None, set[int]]:
+    """Fallback đọc trực tiếp file ảnh mask (.png, .bmp, .tif) nếu không dùng JSON."""
+    for ext in [".png", ".bmp", ".tif", ".jpg"]:
+        for suffix in ["", "_mask", "_gt"]:
+            cand = mask_root / f"{stem}{suffix}{ext}"
+            if cand.exists():
+                m_img = Image.open(cand).convert("L").resize(target_size, Image.NEAREST)
+                m_arr = np.array(m_img, dtype=np.uint8)
+                unique_vals = sorted(np.unique(m_arr).tolist())
+                if max(unique_vals) > 4:
+                    remapped = np.zeros_like(m_arr, dtype=np.uint8)
+                    for idx, val in enumerate(unique_vals):
+                        remapped[m_arr == val] = idx
+                    m_arr = remapped
+                classes = set(int(c) for c in np.unique(m_arr) if c > 0)
+                return (m_arr if classes else None), classes
+    return None, set()
+
+
+def export_split(
+    records: list[dict],
+    out_split_dir: Path,
+    keep_labeled_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    """Lưu ảnh và mặt nạ ra thư mục split tương ứng."""
+    img_out = out_split_dir / "images"
+    msk_out = out_split_dir / "masks"
+    img_out.mkdir(parents=True, exist_ok=True)
+    msk_out.mkdir(parents=True, exist_ok=True)
+
+    labeled_cnt = 0
+    unlabeled_cnt = 0
+
+    for item in records:
+        img_p: Path = item["path"]
+        stem = img_p.stem
+        img = Image.open(img_p).convert("L")
+        img.save(img_out / f"{stem}.png")
+
+        should_save_mask = (keep_labeled_ids is None) or (stem in keep_labeled_ids)
+        if should_save_mask and item["mask"] is not None:
+            Image.fromarray(item["mask"]).save(msk_out / f"{stem}.png")
+            labeled_cnt += 1
+        else:
+            unlabeled_cnt += 1
+
+    return labeled_cnt, unlabeled_cnt
+
+
+def main():
+    args = parse_args()
+    img_dir = Path(args.raw_images)
+    mask_dir = Path(args.raw_masks)
+    out_dir = Path(args.output_dir)
+
+    if not img_dir.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục ảnh: {img_dir}")
+    if not mask_dir.exists():
+        raise FileNotFoundError(f"Không tìm thấy thư mục mask: {mask_dir}")
+
+    coco_index = index_coco_jsons(mask_dir)
+
+    img_files = sorted(
+        [p for p in img_dir.rglob("*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".bmp", ".tif")]
+    )
+    if not img_files:
+        raise RuntimeError(f"Không tìm thấy file ảnh nào trong: {img_dir}")
+
+    print(f"[+] Đang đối sánh {len(img_files)} ảnh với dữ liệu nhãn...")
+
+    all_items = []
+    for img_p in img_files:
+        with Image.open(img_p) as im:
+            sz = im.size
+
+        rec = (
+            coco_index.get(img_p.name)
+            or coco_index.get(img_p.stem)
+            or (coco_index.get(img_p.stem.split(".rf.")[0]) if ".rf." in img_p.stem else None)
+        )
+
+        if rec is not None:
+            mask_arr, classes = rasterize_coco_record(rec, sz)
+            split_hint = rec["split_hint"]
+        else:
+            mask_arr, classes = find_png_mask(mask_dir, img_p.stem, sz)
+            split_hint = "unknown"
+
+        all_items.append({
+            "path": img_p,
+            "stem": img_p.stem,
+            "mask": mask_arr,
+            "classes": classes,
+            "split_hint": split_hint,
+        })
+
+    total_matched = sum(1 for x in all_items if x["mask"] is not None)
+    print(f"[+] Số ảnh tìm thấy nhãn hợp lệ: {total_matched}/{len(all_items)}")
+    if total_matched == 0:
+        raise RuntimeError(
+            "Không khớp được bất kỳ nhãn nào giữa thư mục ảnh và thư mục mask! "
+            "Hãy kiểm tra lại tên file_name trong các file .json có trùng với tên file trong thư mục image hay không."
+        )
+
+    rng = random.Random(args.seed)
+
+    # Phân tách Train / Valid / Test
+    has_explicit_splits = any(x["split_hint"] in ("train", "valid", "test") for x in all_items)
+    explicit_val = [x for x in all_items if x["split_hint"] == "valid" and x["mask"] is not None]
+
+    if has_explicit_splits and len(explicit_val) > 0:
+        print("[+] Sử dụng phân vùng train/valid/test gốc từ các file JSON...")
+        train_items = [x for x in all_items if x["split_hint"] in ("train", "unknown")]
+        val_items = explicit_val
+        test_items = [x for x in all_items if x["split_hint"] == "test" and x["mask"] is not None]
+    else:
+        print(f"[+] Tự động chia tập Valid ({args.val_ratio * 100:.0f}%) từ các ảnh có nhãn...")
+        labeled_pool = [x for x in all_items if x["mask"] is not None]
+        unlabeled_pool = [x for x in all_items if x["mask"] is None]
+        rng.shuffle(labeled_pool)
+
+        num_val = max(1, int(round(len(labeled_pool) * args.val_ratio)))
+        val_items = labeled_pool[:num_val]
+        train_items = labeled_pool[num_val:] + unlabeled_pool
+        test_items = []
+
+    # Chọn lọc phân tầng (Stratified Selection) đúng tỷ lệ labeled_ratio trên tập Train
+    num_labeled_target = max(1, int(round(len(train_items) * args.labeled_ratio)))
+
+    # Ưu tiên 1: Ảnh có đủ cả 3 cấu trúc ZP (1), TE (2), ICM (3)
+    tier_full = [x["stem"] for x in train_items if x["mask"] is not None and {1, 2, 3}.issubset(x["classes"])]
+    # Ưu tiên 2: Ảnh có ít nhất 1 cấu trúc có nhãn
+    tier_partial = [
+        x["stem"] for x in train_items
+        if x["mask"] is not None and x["stem"] not in set(tier_full)
+    ]
+
+    tier_full.sort()
+    tier_partial.sort()
+    rng.shuffle(tier_full)
+    rng.shuffle(tier_partial)
+
+    selected_train_stems = set((tier_full + tier_partial)[:num_labeled_target])
+
+    # Xuất dữ liệu ra đĩa
+    tr_l, tr_u = export_split(train_items, out_dir / "train", keep_labeled_ids=selected_train_stems)
+    va_l, _ = export_split(val_items, out_dir / "valid", keep_labeled_ids=None)
+    te_l = 0
+    if test_items:
+        te_l, _ = export_split(test_items, out_dir / "test", keep_labeled_ids=None)
+
+    print("=" * 72)
+    print(f"HOÀN TẤT CHUẨN HÓA DỮ LIỆU TẠI: {out_dir.resolve()}")
+    print(f" - Train có nhãn (Labeled):      {tr_l} ảnh (Đủ cấu trúc ưu tiên)")
+    print(f" - Train không nhãn (Unlabeled): {tr_u} ảnh")
+    print(f" - Valid (100% Labeled):         {va_l} ảnh")
+    if test_items:
+        print(f" - Test (100% Labeled):          {te_l} ảnh")
+    print("=" * 72)
+
+
+if __name__ == "__main__":
+    main()
+==> ./train.py <==
+"""
+train.py - CLI entrypoint for training TASDF models.
+Thin wrapper delegating directly to the high-level TASDF facade API.
+"""
+import argparse
+from tasdf import TASDF
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TASDF Semi-Supervised Training CLI")
+    parser.add_argument("--config", type=str, default="configs/coco_blastocyst.yaml", help="Path to YAML config")
+    parser.add_argument("--model", type=str, default=None, help="Model YAML or checkpoint .pt")
+    parser.add_argument("--data", type=str, default=None, help="Dataset YAML path or directory")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
+    parser.add_argument("--batch", type=int, default=None, help="Batch size")
+    parser.add_argument("--imgsz", type=int, default=None, help="Image size")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--device", type=str, default=None, help="Target compute device (cuda or cpu)")
+    parser.add_argument("--amp", action="store_true", default=True, help="Use AMP FP16")
+    parser.add_argument("--project", type=str, default="runs/train", help="Run output directory")
+    parser.add_argument("--name", type=str, default="exp", help="Run experiment name")
+    parser.add_argument("--resume", action="store_true", help="Resume from previous checkpoint")
+    parser.add_argument("--info", action="store_true", help="Display model parameter statistics and exit")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    model_src = args.model or args.config
+    model = TASDF(model=model_src)
+
+    if args.info:
+        model.info(detailed=True)
+        return
+
+    data_src = args.data or model.cfg.get("dataset", {})
+
+    kwargs = {}
+    if args.epochs is not None:
+        kwargs["epochs"] = args.epochs
+    if args.batch is not None:
+        kwargs["batch"] = args.batch
+    if args.imgsz is not None:
+        kwargs["imgsz"] = args.imgsz
+    if args.lr is not None:
+        kwargs["lr"] = args.lr
+    if args.device is not None:
+        kwargs["device"] = args.device
+
+    results = model.train(
+        data=data_src,
+        project=args.project,
+        name=args.name,
+        resume=args.resume,
+        amp=args.amp,
+        **kwargs,
+    )
+    print(f"\n[+] Huấn luyện hoàn tất! Checkpoints lưu tại:")
+    print(f"    - Best: {results['best_checkpoint']}")
+    print(f"    - Last: {results['last_checkpoint']}")
+
+
+if __name__ == "__main__":
+    main()
+
+==> ./inference.py <==
+"""
+inference.py - CLI entrypoint for inference and mask visualization on embryo images.
+"""
+import argparse
+from pathlib import Path
+from tasdf import TASDF
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TASDF Inference CLI")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained checkpoint (.pt)")
+    parser.add_argument("--source", type=str, required=True, help="Path to image file or directory")
+    parser.add_argument("--output_dir", type=str, default="runs/predict", help="Output directory")
+    parser.add_argument("--imgsz", type=int, default=256, help="Inference image resolution")
+    parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
+    parser.add_argument("--branch", type=str, default="net1", choices=["net1", "net2", "ensemble"], help="Inference branch")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    model = TASDF(model=args.checkpoint)
+    results = model.predict(
+        source=args.source,
+        imgsz=args.imgsz,
+        output_dir=args.output_dir,
+        device=args.device,
+        branch=args.branch,
+        save=True,
+    )
+    print(f"\n[+] Đã hoàn thành suy luận trên {len(results)} ảnh! Kết quả lưu tại: {Path(args.output_dir).resolve()}")
+
+
+if __name__ == "__main__":
+    main()
+==> ./tasdf/data/folder.py <==
+from pathlib import Path
+from typing import Any
+import numpy as np
+from PIL import Image
+from .base import BaseEmbryoDataset
+
+
+class FolderEmbryoDataset(BaseEmbryoDataset):
+    """
+    Bộ nạp dữ liệu từ thư mục ảnh và mặt nạ rời (Mask PNG).
+    Tự động phân tách file có mặt nạ nhãn và file không có mặt nạ nhãn cho học bán giám sát.
+    Tuyệt đối không sinh mặt nạ giả toàn 0 khi thiếu file nhãn.
+    """
+
+    def __init__(
+        self,
+        data_dir: str | Path,
+        split: str = "",
+        size: int = 256,
+        is_labeled: bool = True,
+        aug_cfg: dict[str, Any] | None = None,
+        is_train: bool | None = None,
+    ):
+        if is_train is None:
+            is_train = split.lower() in ("train", "")
+        super().__init__(size=size, is_labeled=is_labeled, aug_cfg=aug_cfg, is_train=is_train)
+
+        base = Path(data_dir)
+        self.folder_path = base / split if split and (base / split).exists() else base
+
+        img_candidates = [self.folder_path / "images", self.folder_path]
+        self.img_dir = self.folder_path
+        for c in img_candidates:
+            if c.exists() and (list(c.glob("*.jpg")) or list(c.glob("*.png"))):
+                self.img_dir = c
+                break
+
+        self.mask_dir = self.folder_path / "masks"
+        has_separate_mask_dir = self.mask_dir.exists() and self.mask_dir.resolve() != self.img_dir.resolve()
+
+        all_files = sorted(
+            list(self.img_dir.glob("*.jpg")) + list(self.img_dir.glob("*.png"))
+        )
+        # Loại trừ các file có hậu tố _mask.png nếu chung thư mục
+        self.img_files = [f for f in all_files if not f.stem.endswith("_mask")]
+
+        self.mask_paths: dict[int, Path] = {}
+        self.labeled_indices: list[int] = []
+        self.unlabeled_indices: list[int] = []
+
+        for idx, img_p in enumerate(self.img_files):
+            mask_p = self._find_mask_path(img_p, has_separate_mask_dir)
+            if mask_p is not None:
+                self.mask_paths[idx] = mask_p
+                self.labeled_indices.append(idx)
+            else:
+                self.unlabeled_indices.append(idx)
+
+    def _find_mask_path(self, img_p: Path, has_separate_mask_dir: bool) -> Path | None:
+        candidates = []
+        if has_separate_mask_dir:
+            candidates.extend([
+                self.mask_dir / f"{img_p.stem}.png",
+                self.mask_dir / f"{img_p.stem}_mask.png",
+                self.mask_dir / img_p.name,
+            ])
+        else:
+            candidates.append(self.img_dir / f"{img_p.stem}_mask.png")
+
+        for c in candidates:
+            if c.exists() and c.resolve() != img_p.resolve():
+                return c
+        return None
+
+    def __len__(self) -> int:
+        return len(self.img_files)
+
+    def __getitem__(self, idx: int):
+        img_p = self.img_files[idx]
+        if not self.is_labeled:
+            return self.preprocess_image(str(img_p))
+
+        mask_p = self.mask_paths.get(idx)
+        if mask_p is None or not mask_p.exists():
+            raise FileNotFoundError(
+                f"Không tìm thấy mặt nạ nhãn cho ảnh '{img_p.name}'. "
+                f"Trong mô hình bán giám sát TASDF, ảnh không nhãn phải được đưa vào unlabeled_loader (is_labeled=False)."
+            )
+
+        mask_img = Image.open(mask_p)
+        mask_np = np.array(mask_img, dtype=np.uint8)
+        if mask_np.ndim == 3:
+            mask_np = mask_np[:, :, 0]
+
+        img_tensor, mask_tensor = self.preprocess_pair(str(img_p), mask_np)
+        return img_tensor, mask_tensor
+==> ./tasdf/data/coco.py <==
+import json
+from pathlib import Path
+from typing import Any
+import cv2
+import numpy as np
+import torch
+from .base import BaseEmbryoDataset
+
+
+class COCOEmbryoDataset(BaseEmbryoDataset):
+    """
+    Bộ nạp dữ liệu phôi nang từ định dạng COCO Segmentation JSON.
+    """
+
+    def __init__(
+        self,
+        root_dir: str | Path,
+        split: str = "train",
+        size: int = 256,
+        is_labeled: bool = True,
+        class_mapping: dict[str, int] | None = None,
+        aug_cfg: dict[str, Any] | None = None,
+        is_train: bool | None = None,
+    ):
+        if is_train is None:
+            is_train = split.lower() == "train"
+        super().__init__(size=size, is_labeled=is_labeled, aug_cfg=aug_cfg, is_train=is_train)
+        self.root_path = Path(root_dir)
+        self.split = split
+
+        candidates = [
+            self.root_path / split / "_annotations.coco.json",
+            self.root_path / split / "annotations.json",
+            self.root_path / f"annotations/{split}.json",
+            self.root_path / "_annotations.coco.json",
+            self.root_path / "annotations.json",
+        ]
+        json_path = None
+        for c in candidates:
+            if c.exists():
+                json_path = c
+                break
+
+        if not json_path:
+            raise FileNotFoundError(
+                f"Không tìm thấy file nhãn COCO trong '{self.root_path}' cho tập '{split}'."
+            )
+
+        with open(json_path, "r", encoding="utf-8") as f:
+            self.coco = json.load(f)
+
+        self.img_dir = json_path.parent
+        self.images = self.coco.get("images", [])
+        self.cat_id_to_name = {cat["id"]: cat["name"] for cat in self.coco.get("categories", [])}
+
+        self.img_id_to_anns: dict[int, list[dict[str, Any]]] = {}
+        for ann in self.coco.get("annotations", []):
+            if ann.get("segmentation"):
+                self.img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
+
+        self.class_mapping = class_mapping
+
+        # Phân loại rõ chỉ số ảnh có nhãn và không nhãn thực tế
+        self.labeled_indices: list[int] = []
+        self.unlabeled_indices: list[int] = []
+        for idx, img_info in enumerate(self.images):
+            if len(self.img_id_to_anns.get(img_info["id"], [])) > 0:
+                self.labeled_indices.append(idx)
+            else:
+                self.unlabeled_indices.append(idx)
+
+    def _map_category_to_class_id(self, cat_name: str) -> int:
+        if self.class_mapping and cat_name in self.class_mapping:
+            return self.class_mapping[cat_name]
+        name_upper = cat_name.upper()
+        if "ZP" in name_upper or "ZONA" in name_upper:
+            return 1
+        elif "TE" in name_upper or "TROPHECTODERM" in name_upper:
+            return 2
+        elif "ICM" in name_upper or "INNER" in name_upper:
+            return 3
+        elif "BC" in name_upper or "BLASTOCOEL" in name_upper or "CAVITY" in name_upper or "BLASTOCYST" in name_upper:
+            return 4
+        return 0
+
+    def _rasterize_polygons(self, anns: list, orig_w: int, orig_h: int) -> np.ndarray:
+        mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+
+        def draw_priority(ann):
+            cid = self._map_category_to_class_id(self.cat_id_to_name.get(ann["category_id"], ""))
+            # Vẽ khoang/lớp nền trước, ZP -> TE -> ICM sau để không đè mất cấu trúc nhỏ
+            priority_map = {4: 0, 1: 1, 2: 2, 3: 3}
+            return priority_map.get(cid, 0)
+
+        sorted_anns = sorted(anns, key=draw_priority)
+        for ann in sorted_anns:
+            cat_name = self.cat_id_to_name.get(ann["category_id"], "")
+            class_id = self._map_category_to_class_id(cat_name)
+            if class_id <= 0:
+                continue
+            for seg in ann.get("segmentation", []):
+                poly = np.array(seg, dtype=np.int32).reshape(-1, 2)
+                cv2.fillPoly(mask, [poly], color=class_id)
+        return mask
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def __getitem__(self, idx: int):
+        img_info = self.images[idx]
+        img_path = self.img_dir / img_info["file_name"]
+        if not img_path.exists():
+            img_path = self.root_path / img_info["file_name"]
+
+        if not self.is_labeled:
+            return self.preprocess_image(str(img_path))
+
+        anns = self.img_id_to_anns.get(img_info["id"], [])
+        if not anns:
+            raise ValueError(
+                f"Ảnh '{img_info['file_name']}' (id={img_info['id']}) không có nhãn annotation. "
+                f"Không được phép nạp mẫu không nhãn vào luồng có giám sát (is_labeled=True)."
+            )
+
+        orig_w = img_info.get("width", self.size)
+        orig_h = img_info.get("height", self.size)
+        mask_np = self._rasterize_polygons(anns, orig_w, orig_h)
+        img_tensor, mask_tensor = self.preprocess_pair(str(img_path), mask_np)
+        return img_tensor, mask_tensor
+==> ./tasdf/data/transforms.py <==
+import random
+from typing import Any
+import cv2
+import numpy as np
+
+
+class EmbryoTransformPipeline:
+    """
+    Quy trình tiền xử lý khử nhiễu và tăng cường dữ liệu 5 bước theo bài báo TASDF (Mục 4.2):
+    1. Random Rotation (Xoay ngẫu nhiên đồng bộ ảnh & mask)
+    2. Random Scale Crop (Co giãn tỷ lệ và cắt ngẫu nhiên đồng bộ ảnh & mask)
+    3. Random Horizontal Flip (Lật ngang ngẫu nhiên đồng bộ ảnh & mask)
+    4. Color Jitter (Biến đổi độ sáng và độ tương phản trên ảnh)
+    5. Random Gaussian Blur (Làm mờ Gaussian ngẫu nhiên trên ảnh)
+    """
+
+    def __init__(self, size: int = 256, cfg: dict[str, Any] | None = None, is_train: bool = True):
+        self.size = size
+        self.cfg = cfg or {}
+        self.is_train = is_train
+        self.enabled = bool(self.cfg.get("enabled", True)) and is_train
+
+        self.denoise_cfg = self.cfg.get("denoise", {})
+        self.denoise_enabled = bool(self.denoise_cfg.get("enabled", False))
+
+    def apply_denoise(self, image: np.ndarray) -> np.ndarray:
+        """Khử nhiễu tiền xử lý cho ảnh kính hiển vi HMC (áp dụng trên ảnh uint8 [0, 255])."""
+        if not self.denoise_enabled:
+            return image
+
+        method = str(self.denoise_cfg.get("method", "median")).lower()
+        ksize = int(self.denoise_cfg.get("kernel_size", 3))
+        if ksize % 2 == 0:
+            ksize += 1
+
+        if method == "median":
+            return cv2.medianBlur(image, ksize)
+        elif method == "gaussian":
+            return cv2.GaussianBlur(image, (ksize, ksize), 0)
+        elif method == "clahe":
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            return clahe.apply(image)
+        return image
+
+    def _random_rotation(
+        self, img: np.ndarray, mask: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        max_deg = float(self.cfg.get("max_rotation_deg", 30.0))
+        angle = random.uniform(-max_deg, max_deg)
+        h, w = img.shape[:2]
+        center = (w / 2.0, h / 2.0)
+        mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+        img_rot = cv2.warpAffine(
+            img, mat, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+        )
+        mask_rot = None
+        if mask is not None:
+            mask_rot = cv2.warpAffine(
+                mask, mat, (w, h), flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0
+            )
+        return img_rot, mask_rot
+
+    def _random_scale_crop(
+        self, img: np.ndarray, mask: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        scale_range = self.cfg.get("scale_range", [0.85, 1.15])
+        scale = random.uniform(float(scale_range[0]), float(scale_range[1]))
+        h, w = img.shape[:2]
+        new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+
+        img_scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask_scaled = (
+            cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+            if mask is not None
+            else None
+        )
+
+        if new_h >= self.size and new_w >= self.size:
+            top = random.randint(0, new_h - self.size)
+            left = random.randint(0, new_w - self.size)
+            img_cropped = img_scaled[top : top + self.size, left : left + self.size]
+            mask_cropped = (
+                mask_scaled[top : top + self.size, left : left + self.size]
+                if mask_scaled is not None
+                else None
+            )
+        else:
+            pad_h = max(0, self.size - new_h)
+            pad_w = max(0, self.size - new_w)
+            top = pad_h // 2
+            bottom = pad_h - top
+            left = pad_w // 2
+            right = pad_w - left
+            img_cropped = cv2.copyMakeBorder(
+                img_scaled, top, bottom, left, right, cv2.BORDER_REFLECT_101
+            )
+            mask_cropped = (
+                cv2.copyMakeBorder(
+                    mask_scaled, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0
+                )
+                if mask_scaled is not None
+                else None
+            )
+
+        return img_cropped, mask_cropped
+
+    def _random_horizontal_flip(
+        self, img: np.ndarray, mask: np.ndarray | None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        prob = float(self.cfg.get("flip_prob", 0.5))
+        if random.random() < prob:
+            img = np.fliplr(img).copy()
+            if mask is not None:
+                mask = np.fliplr(mask).copy()
+        return img, mask
+
+    def _color_jitter(self, img: np.ndarray) -> np.ndarray:
+        brightness_delta = float(self.cfg.get("brightness_delta", 0.15))
+        contrast_range = self.cfg.get("contrast_range", [0.85, 1.15])
+
+        alpha = random.uniform(float(contrast_range[0]), float(contrast_range[1]))
+        beta = random.uniform(-brightness_delta, brightness_delta)
+        img_out = img * alpha + beta
+        return np.clip(img_out, 0.0, 1.0)
+
+    def _gaussian_blur(self, img: np.ndarray) -> np.ndarray:
+        prob = float(self.cfg.get("blur_prob", 0.3))
+        if random.random() < prob:
+            ksize = random.choice([3, 5])
+            sigma = random.uniform(0.1, 1.5)
+            img = cv2.GaussianBlur(img, (ksize, ksize), sigmaX=sigma)
+        return img
+
+    def __call__(
+        self, image_uint8: np.ndarray, mask: np.ndarray | None = None
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        # 1. Tiền xử lý khử nhiễu (nếu bật)
+        img = self.apply_denoise(image_uint8)
+
+        # 2. Đưa về kích thước chuẩn trước khi biến đổi
+        img = cv2.resize(img, (self.size, self.size), interpolation=cv2.INTER_LINEAR)
+        if mask is not None:
+            mask = cv2.resize(mask, (self.size, self.size), interpolation=cv2.INTER_NEAREST)
+
+        # 3. Các phép biến đổi hình học trên tập train (nếu bật)
+        if self.enabled:
+            if self.cfg.get("random_rotation", True):
+                img, mask = self._random_rotation(img, mask)
+            if self.cfg.get("random_scale_crop", True):
+                img, mask = self._random_scale_crop(img, mask)
+            if self.cfg.get("random_horizontal_flip", True):
+                img, mask = self._random_horizontal_flip(img, mask)
+
+        # 4. Chuẩn hóa về [0.0, 1.0]
+        img_float = img.astype(np.float32) / 255.0
+
+        # 5. Các phép biến đổi quang học trên tập train (nếu bật)
+        if self.enabled:
+            if self.cfg.get("color_jitter", True):
+                img_float = self._color_jitter(img_float)
+            if self.cfg.get("gaussian_blur", True):
+                img_float = self._gaussian_blur(img_float)
+
+        img_float = np.clip(img_float, 0.0, 1.0).astype(np.float32)
+        return img_float, mask
+==> ./tasdf/data/builder.py <==
+from typing import Tuple
+import torch
+from torch.utils.data import DataLoader, Dataset, Subset
+
+from .coco import COCOEmbryoDataset
+from .folder import FolderEmbryoDataset
+
+
+def build_dataset(
+    data_cfg: dict, split: str = "train", is_labeled: bool = True, is_train: bool | None = None
+) -> Dataset:
+    """Factory khởi tạo Dataset tương ứng với cấu hình và chế độ tăng cường dữ liệu."""
+    ds_type = (data_cfg.get("type") or data_cfg.get("format", "coco")).lower()
+    root_dir = data_cfg.get("path") or data_cfg.get("root_dir", ".")
+    size = int(data_cfg.get("image_size", 256))
+    aug_cfg = data_cfg.get("augmentation")
+
+    actual_split = data_cfg.get(split, split)
+    if is_train is None:
+        is_train = split.lower() == "train"
+
+    if ds_type == "coco":
+        return COCOEmbryoDataset(
+            root_dir=root_dir,
+            split=actual_split,
+            size=size,
+            is_labeled=is_labeled,
+            aug_cfg=aug_cfg,
+            is_train=is_train,
+        )
+    elif ds_type in ("folder", "embryo", "mask"):
+        return FolderEmbryoDataset(
+            data_dir=root_dir,
+            split=actual_split,
+            size=size,
+            is_labeled=is_labeled,
+            aug_cfg=aug_cfg,
+            is_train=is_train,
+        )
+    else:
+        raise ValueError(
+            f"Định dạng dữ liệu '{ds_type}' chưa được hỗ trợ. Hỗ trợ: ['coco', 'folder']"
+        )
+
+
+def build_dataloaders(
+    data_cfg: dict,
+    batch_size: int = 4,
+    num_workers: int = 2,
+    pin_memory: bool = True,
+    seed: int = 42,
+) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    """
+    Tạo bộ ba DataLoader: (labeled_loader, unlabeled_loader, val_loader).
+    Đảm bảo 100% các mẫu trong labeled_loader đều có nhãn thật và không bao giờ
+    lấy nhầm mẫu khuyết nhãn vào luồng giám sát.
+    """
+    full_train = build_dataset(data_cfg, split="train", is_labeled=True, is_train=True)
+    unlabeled_train = build_dataset(data_cfg, split="train", is_labeled=False, is_train=True)
+
+    total_samples = len(full_train)
+    avail_labeled = getattr(full_train, "labeled_indices", list(range(total_samples)))
+    avail_unlabeled = getattr(full_train, "unlabeled_indices", [])
+
+    if len(avail_labeled) == 0:
+        raise RuntimeError("Tập huấn luyện không có bất kỳ mẫu nào có nhãn để học bán giám sát!")
+
+    split_mode = str(data_cfg.get("split_mode", "auto")).lower()
+    use_physical = bool(data_cfg.get("use_physical_split", False)) or split_mode == "physical"
+
+    # Nếu tập dữ liệu đã được tách sẵn ảnh không nhãn vật lý (như bộ 10% COCO hoặc thư mục thiếu mask)
+    # và người dùng chọn 'physical' hoặc 'auto' (khi không ép cắt nhỏ hơn nữa):
+    if use_physical or (split_mode == "auto" and len(avail_unlabeled) > 0 and "labeled_ratio" not in data_cfg):
+        labeled_indices = list(avail_labeled)
+        unlabeled_indices = list(avail_unlabeled)
+    else:
+        labeled_ratio = float(data_cfg.get("labeled_ratio", 0.10))
+        # Nếu bộ dữ liệu đã được lọc vật lý sẵn về đúng tỷ lệ, giữ nguyên tập có nhãn vật lý
+        if len(avail_unlabeled) > 0 and len(avail_labeled) <= max(1, round(total_samples * labeled_ratio)):
+            labeled_indices = list(avail_labeled)
+            unlabeled_indices = list(avail_unlabeled)
+        else:
+            # Chia từ tập các mẫu thực sự có nhãn (avail_labeled)
+            target_num_labeled = max(1, int(round(len(avail_labeled) * labeled_ratio)))
+            target_num_labeled = min(target_num_labeled, len(avail_labeled))
+
+            generator = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(len(avail_labeled), generator=generator).tolist()
+
+            labeled_indices = [avail_labeled[i] for i in perm[:target_num_labeled]]
+            remaining_labeled_as_unlabeled = [avail_labeled[i] for i in perm[target_num_labeled:]]
+            unlabeled_indices = remaining_labeled_as_unlabeled + list(avail_unlabeled)
+
+            # Trường hợp labeled_ratio = 1.0 (100% labeled) và không có ảnh không nhãn vật lý:
+            # dùng toàn bộ ảnh cho cả nhánh chưng cất để duy trì tính nhất quán
+            if len(unlabeled_indices) == 0:
+                unlabeled_indices = list(labeled_indices)
+
+    pin = pin_memory and torch.cuda.is_available()
+
+    labeled_loader = DataLoader(
+        Subset(full_train, labeled_indices),
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True if len(labeled_indices) >= batch_size else False,
+        num_workers=num_workers,
+        pin_memory=pin,
+    )
+    unlabeled_loader = DataLoader(
+        Subset(unlabeled_train, unlabeled_indices),
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True if len(unlabeled_indices) >= batch_size else False,
+        num_workers=num_workers,
+        pin_memory=pin,
+    )
+
+    val_split_name = "val" if "val" in data_cfg else "valid"
+    val_ds = build_dataset(data_cfg, split=val_split_name, is_labeled=True, is_train=False)
+    val_avail_labeled = getattr(val_ds, "labeled_indices", list(range(len(val_ds))))
+    val_subset = Subset(val_ds, val_avail_labeled) if len(val_avail_labeled) < len(val_ds) else val_ds
+
+    val_loader = DataLoader(
+        val_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin,
+    )
+
+    return labeled_loader, unlabeled_loader, val_loader
+==> ./tasdf/data/base.py <==
+from abc import ABC, abstractmethod
+from typing import Any
+import numpy as np
+from PIL import Image
+import torch
+from torch.utils.data import Dataset
+from .transforms import EmbryoTransformPipeline
+
+
+class BaseEmbryoDataset(Dataset, ABC):
+    """
+    Interface cơ sở cho tất cả các loại Dataset phôi học trong TASDF.
+    Hỗ trợ tiền xử lý và tăng cường dữ liệu điều khiển qua config.
+    """
+
+    def __init__(
+        self,
+        size: int = 256,
+        is_labeled: bool = True,
+        aug_cfg: dict[str, Any] | None = None,
+        is_train: bool = False,
+    ):
+        self.size = size
+        self.is_labeled = is_labeled
+        self.transform = EmbryoTransformPipeline(size=size, cfg=aug_cfg, is_train=is_train)
+
+    @abstractmethod
+    def __len__(self) -> int:
+        pass
+
+    @abstractmethod
+    def __getitem__(self, idx: int):
+        pass
+
+    def load_raw_grayscale(self, img_path: str) -> np.ndarray:
+        """Đọc ảnh xám gốc dưới dạng mảng uint8 [H, W]."""
+        img = Image.open(img_path).convert("L")
+        return np.array(img, dtype=np.uint8)
+
+    def preprocess_pair(
+        self, img_path: str, mask_np: np.ndarray | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Áp dụng pipeline biến đổi đồng bộ cho ảnh và mặt nạ."""
+        raw_img = self.load_raw_grayscale(img_path)
+        img_float, mask_out = self.transform(raw_img, mask_np)
+        img_tensor = torch.tensor(img_float, dtype=torch.float32).unsqueeze(0)
+        if mask_out is None:
+            return img_tensor, None
+        return img_tensor, torch.tensor(mask_out, dtype=torch.long)
+
+    def preprocess_image(self, img_path: str) -> torch.Tensor:
+        """Đọc và chuẩn hóa một ảnh đơn lẻ (dùng cho nhánh không nhãn)."""
+        img_tensor, _ = self.preprocess_pair(img_path, mask_np=None)
+        return img_tensor
+==> ./tasdf/data/__init__.py <==
+from .base import BaseEmbryoDataset
+from .coco import COCOEmbryoDataset
+from .folder import FolderEmbryoDataset
+from .transforms import EmbryoTransformPipeline
+from .builder import build_dataset, build_dataloaders
+
+__all__ = [
+    "BaseEmbryoDataset",
+    "COCOEmbryoDataset",
+    "FolderEmbryoDataset",
+    "EmbryoTransformPipeline",
+    "build_dataset",
+    "build_dataloaders",
+]
+==> ./tasdf/models/final_model.py <==
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .unet_backbone import UNetBackbone
+from .dual_heads import DualHeads
+
+
+class TASDFSubNet(nn.Module):
+    """Một nhánh mạng con độc lập N_i trong khung kiến trúc NSW của TASDF."""
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_channels: int = 64,
+        num_classes: int = 5,
+        k_iters: int = 10,
+    ):
+        super(TASDFSubNet, self).__init__()
+        self.backbone = UNetBackbone(
+            in_channels=in_channels, base_channels=base_channels
+        )
+        self.heads = DualHeads(
+            in_channels=base_channels,
+            num_classes=num_classes,
+            k_iters=k_iters,
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        f = self.backbone(x)
+        p, t = self.heads(f)
+        return p, t
+
+
+class TASDFNet(nn.Module):
+    """
+    Mô hình TASDF gồm 2 mạng con không chia sẻ trọng số (Non-Shared Weights: net1, net2).
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        base_channels: int = 64,
+        num_classes: int = 5,
+        k_iters: int = 10,
+    ):
+        super(TASDFNet, self).__init__()
+        self.num_classes = num_classes
+        self.net1 = TASDFSubNet(in_channels, base_channels, num_classes, k_iters)
+        self.net2 = TASDFSubNet(in_channels, base_channels, num_classes, k_iters)
+
+    def forward(self, x: torch.Tensor, branch: str = "both"):
+        if branch == "net1":
+            return self.net1(x)
+        elif branch == "net2":
+            return self.net2(x)
+        elif branch == "both":
+            p1, t1 = self.net1(x)
+            p2, t2 = self.net2(x)
+            return (p1, t1), (p2, t2)
+        elif branch == "ensemble":
+            p1, t1 = self.net1(x)
+            p2, t2 = self.net2(x)
+            # Trung bình trên phân phối xác suất softmax để đồng nhất với Validator và Predictor
+            prob_mean = (F.softmax(p1, dim=1) + F.softmax(p2, dim=1)) / 2.0
+            p_ens = torch.log(torch.clamp(prob_mean, min=1e-8))
+            t_ens = (t1 + t2) / 2.0
+            return p_ens, t_ens
+        else:
+            raise ValueError(
+                f"Giá trị branch không hợp lệ: {branch}. Chọn 'both', 'net1', 'net2' hoặc 'ensemble'."
+            )
+==> ./tasdf/models/unet_backbone.py <==
+import torch
+import torch.nn as nn
+from .unet_blocks import DoubleConv, Up, Down
+
+
+class UNetBackbone(nn.Module):
+    """
+    Unet Backbone 4 layer
+    Args:
+        Input: Image.
+        Output: Feature map F with 64 channels
+
+        F will be share into Pixel Head and Topo Head
+    """
+
+    def __init__(self, in_channels: int = 1, base_channels: int = 64):
+        super(UNetBackbone,self).__init__()
+
+        self.in_channels = in_channels
+        self.base_channels = base_channels
+
+        self.inc = DoubleConv(in_channels, base_channels)
+
+        self.down1 = Down(base_channels, base_channels * 2)
+        self.down2 = Down(base_channels * 2, base_channels * 4)
+        self.down3 = Down(base_channels * 4, base_channels * 8)
+        self.down4 = Down(base_channels * 8, base_channels * 16)
+
+
+        self.up1 = Up(base_channels * 16, base_channels * 8)
+        self.up2 = Up(base_channels * 8, base_channels * 4)
+        self.up3 = Up(base_channels * 4, base_channels * 2)
+        self.up4 = Up(base_channels * 2, base_channels)
+
+    def forward(self, x: torch. Tensor) -> torch.Tensor:
+        """
+        DataFlow
+        x: [B,1,H,W]
+        Return F:[B,64,H,W]
+        """
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+
+        x = self.up1(x5,x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+
+        return x
+==> ./tasdf/models/unet_blocks.py <==
+import torch 
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class DoubleConv(nn.Module):
+    """ Double Convolution (Conv3x3 -> BatchNorm -> ReLU) x 2"""
+
+    def __init__(self, in_channels : int, out_channels: int):
+        super(DoubleConv, self).__init__()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size = 3, padding = 1, bias = False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                out_channels, out_channels, kernel_size = 3, padding = 1, bias = False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return self.double_conv(x)
+
+
+
+class Down(nn.Module):
+    """Erosion Block (Downsampling): MaxPoo2d 2x2 """
+
+    def __init__(self, in_channels:int, out_channels:int):
+        super(Down,self).__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_channels, out_channels)
+        )
+
+    def forward(self, x:torch.Tensor) -> torch.Tensor:
+        return self.maxpool_conv(x)
+
+class Up(nn.Module):
+    """Upsampling: Upscale 2x -> Skip connection -> Double Conv"""
+
+    def __init__(self, in_channels:int, out_channels:int):
+        super(Up, self).__init__()
+
+        self.up = nn.ConvTranspose2d(
+            in_channels, in_channels // 2, kernel_size=2, stride=2
+        )
+        self.conv = DoubleConv(in_channels, out_channels)
+
+    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
+        """x1: Down Tensor of Decoder, x2: Skip Connection Tensor from Encoder"""
+
+        x1 = self.up(x1)
+        #Handle odd size difference 
+
+        diff_y = x2.size()[2] - x1.size()[2]
+        diff_x = x2.size()[3] - x1.size()[3]
+
+        if diff_y > 0 or diff_x > 0:
+            x1 = F.pad(
+                x1,
+                [
+                    diff_x //2,
+                    diff_x - diff_x //2,
+                    diff_y //2,
+                    diff_y - diff_y //2,
+                ],
+            )
+        x = torch.cat([x2,x1], dim = 1)
+        return self.conv(x)
+==> ./tasdf/models/itgm.py <==
+import torch
+import torch.nn as nn
+
+
+
+class ITGM(nn.Module):
+    """Implicit Topology Guidance Module"""
+
+    def __init__(self, iterations: int = 10, kernel_size: int = 3):
+        super(ITGM, self).__init__()
+        self.iterations = iterations
+        padding = kernel_size // 2
+
+        #max pool
+
+        self.maxpool = nn.MaxPool2d(
+            kernel_size = kernel_size, stride=1, padding=padding
+        )
+
+    def minpool(self, x: torch.Tensor) -> torch.Tensor:
+        """ Differentiable Erosion Operator - min(x) = -max(-x)"""
+
+        return -self.maxpool(-x)
+
+    def forward(self, x:torch.Tensor, return_intermediates: bool = False):
+        """ Extract soft-skeleton through loop self.iteractions 
+            Args:
+                x: Input Tensor (B,C,H,W) values [0,1]
+            Returns:
+                skeleton: soft skeleton maps with (B,C,H,W)
+                (options) History: List of states across each iteractions
+        
+        """
+        history = []
+
+        #Init soft skeleton 
+        f = x
+        f_prime = self.maxpool(self.minpool(f))
+
+        s_0 = torch.relu(f - f_prime)
+        skeleton = s_0
+
+        if return_intermediates:
+            history.append(
+                {
+                    "step": 0,
+                    "f_eroded": f.clone(),
+                    "s_residual": s_0.clone(),
+                    "accumulated_skeleton": skeleton.clone()
+                }
+            )
+
+
+        for i in range(self.iterations):
+            f = self.minpool(f)
+            f_prime = self.maxpool(self.minpool(f))
+            s_i = torch.relu(f - f_prime)
+
+            skeleton = skeleton + (1.0 - skeleton) * s_i
+            if return_intermediates:
+                history.append(
+                {
+                    "step": i+1,
+                    "f_eroded": f.clone(),
+                    "s_residual": s_i.clone(),
+                    "accumulated_skeleton": skeleton.clone()
+                }
+            )
+
+        if return_intermediates:
+            return skeleton, history
+        return skeleton
+
+
+
+
+==> ./tasdf/models/dual_heads.py <==
+import torch
+import torch.nn as nn
+from .itgm import ITGM
+
+
+class PixelHead(nn.Module):
+    """Nhánh dự đoán phân đoạn mức điểm ảnh (Pixel-level segmentation head)."""
+
+    def __init__(self, in_channels: int = 64, num_classes: int = 5):
+        super(PixelHead, self).__init__()
+        self.conv = nn.Conv2d(in_channels, num_classes, kernel_size=1)
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        return self.conv(f)
+
+
+class TopoHead(nn.Module):
+    """
+    Nhánh dự đoán cấu trúc tô-pô với mô-đun ITGM:
+    - Ánh xạ bản đồ đặc trưng F sang C_topo kênh cấu trúc giải phẫu qua Conv + Sigmoid.
+    - Trích xuất khung xương mềm qua k vòng lặp hình thái học ITGM.
+    - Thực hiện kết nối tắt nhân từng phần tử (element-wise multiplication) giữa
+      bản đồ cấu trúc và khung xương mềm để bảo toàn tính liên thông giải phẫu.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 64,
+        topo_channels: int = 4,
+        k_iters: int = 10,
+    ):
+        super(TopoHead, self).__init__()
+        self.topo_channels = max(1, topo_channels)
+        self.proj = nn.Conv2d(in_channels, self.topo_channels, kernel_size=1)
+        self.itgm = ITGM(iterations=k_iters)
+
+    def forward(self, f: torch.Tensor) -> torch.Tensor:
+        """
+        f: [B, in_channels, H, W]
+        Trả về T: [B, topo_channels, H, W] thuộc miền [0, 1]
+        """
+        struct_prob = torch.sigmoid(self.proj(f))
+        soft_skeleton = self.itgm(struct_prob)
+        # Phép nhân từng phần tử (skip connection multiplication) theo Hình 2(b)
+        topo_map = soft_skeleton * struct_prob
+        return topo_map
+
+
+class DualHeads(nn.Module):
+    """Kết hợp song song PixelHead và TopoHead."""
+
+    def __init__(self, in_channels: int = 64, num_classes: int = 5, k_iters: int = 10):
+        super(DualHeads, self).__init__()
+        topo_channels = max(1, num_classes - 1)
+        self.pixel_head = PixelHead(in_channels=in_channels, num_classes=num_classes)
+        self.topo_head = TopoHead(
+            in_channels=in_channels,
+            topo_channels=topo_channels,
+            k_iters=k_iters,
+        )
+
+    def forward(self, f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        p_logits = self.pixel_head(f)
+        t_skeleton = self.topo_head(f)
+        return p_logits, t_skeleton
+==> ./tasdf/models/__init__.py <==
+from .itgm import ITGM
+from .unet_blocks import DoubleConv, Down, Up
+from .unet_backbone import UNetBackbone
+from .dual_heads import PixelHead, TopoHead, DualHeads
+from .final_model import TASDFSubNet, TASDFNet
+
+__all__ = [
+    "ITGM",
+    "DoubleConv",
+    "Down",
+    "Up",
+    "UNetBackbone",
+    "PixelHead",
+    "TopoHead",
+    "DualHeads",
+    "TASDFSubNet",
+    "TASDFNet",
+]
+
+==> ./tasdf/engine/predictor.py <==
+from pathlib import Path
+from typing import Any
+import cv2
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+
+from tasdf.utils.metrics import (
+    colorize_mask,
+    DEFAULT_CLASS_NAMES,
+    DEFAULT_PALETTE,
+)
+
+
+class Predictor:
+    """
+    Động cơ suy luận và trực quan hóa phân đoạn phôi học thuần túy từ dự đoán của mạng TASDF.
+    """
+
+    def __init__(
+        self,
+        image_size: int = 256,
+        device: torch.device | None = None,
+        palette: dict[int, tuple[int, int, int]] | None = None,
+        class_names: dict[int, str] | None = None,
+        branch: str = "net1",
+    ):
+        self.image_size = image_size
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.palette = palette or DEFAULT_PALETTE
+        self.class_names = class_names or DEFAULT_CLASS_NAMES
+        self.branch = branch
+
+    def predict_single(
+        self, model: nn.Module, img_path: str | Path
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Suy luận trực tiếp trên một ảnh duy nhất."""
+        path = Path(img_path)
+        orig_img = Image.open(path).convert("RGB")
+        orig_w, orig_h = orig_img.size
+        orig_np = np.array(orig_img)
+
+        gray_resized = orig_img.convert("L").resize((self.image_size, self.image_size))
+        img_tensor = (
+            torch.tensor(np.array(gray_resized, dtype=np.float32) / 255.0)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+
+        model.eval()
+        with torch.no_grad():
+            if self.branch == "ensemble":
+                (p1, _), (p2, _) = model(img_tensor, branch="both")
+                probs = (torch.softmax(p1, dim=1) + torch.softmax(p2, dim=1)) / 2.0
+            else:
+                p, _ = model(img_tensor, branch=self.branch)
+                probs = torch.softmax(p, dim=1)
+
+            pred_small = torch.argmax(probs, dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+
+        pred_orig = cv2.resize(
+            pred_small, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST
+        )
+        return orig_np, pred_orig
+
+    def save_results(
+        self, orig_rgb: np.ndarray, pred_mask: np.ndarray, out_dir: Path, stem: str
+    ) -> dict[str, str]:
+        """Lưu mặt nạ số, ảnh phủ màu và ảnh đối sánh."""
+        out_dir.mkdir(parents=True, exist_ok=True)
+        color_mask = colorize_mask(pred_mask, self.palette)
+
+        overlay = cv2.addWeighted(orig_rgb, 0.65, color_mask, 0.35, 0)
+        composite = np.hstack([orig_rgb, color_mask, overlay])
+
+        paths = {
+            "mask_raw": str(out_dir / f"{stem}_mask_raw.png"),
+            "overlay": str(out_dir / f"{stem}_overlay.png"),
+            "composite": str(out_dir / f"{stem}_composite.png"),
+        }
+        cv2.imwrite(paths["mask_raw"], pred_mask)
+        cv2.imwrite(paths["overlay"], cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(paths["composite"], cv2.cvtColor(composite, cv2.COLOR_RGB2BGR))
+        return paths
+
+    def predict(
+        self,
+        model: nn.Module,
+        source: str | Path | list[Path],
+        output_dir: str | Path = "runs/predict",
+        save: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Chạy dự đoán trên nguồn dữ liệu (file ảnh đơn, danh sách hoặc thư mục)."""
+        model = model.to(self.device)
+        out_p = Path(output_dir)
+
+        if isinstance(source, (str, Path)):
+            src_p = Path(source)
+            if src_p.is_file():
+                files = [src_p]
+            elif src_p.is_dir():
+                files = sorted(list(src_p.glob("*.jpg")) + list(src_p.glob("*.png")))
+            else:
+                raise FileNotFoundError(f"Không tìm thấy đường dẫn nguồn: {source}")
+        else:
+            files = [Path(f) for f in source]
+
+        results = []
+        for f in files:
+            orig_rgb, pred_mask = self.predict_single(model, f)
+            counts = {
+                self.class_names.get(int(c), str(c)): int((pred_mask == c).sum())
+                for c in np.unique(pred_mask)
+                if c > 0
+            }
+
+            res_item: dict[str, Any] = {
+                "file": str(f),
+                "stem": f.stem,
+                "counts": counts,
+                "mask": pred_mask,
+            }
+
+            if save:
+                saved_paths = self.save_results(orig_rgb, pred_mask, out_p, f.stem)
+                res_item["saved_paths"] = saved_paths
+
+            results.append(res_item)
+            print(f"   [+] {f.stem}: {counts if counts else 'Background only'}")
+
+        return results
+==> ./tasdf/engine/logger.py <==
+from datetime import datetime
+import json
+from pathlib import Path
+from typing import Any
+import torch
+
+
+class DualLogger:
+    """Hệ thống ghi nhận kép Text stream & JSON stream."""
+
+    def __init__(self, output_dir: str | Path, exp_name: str = "train"):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.log_file = self.output_dir / "train.log"
+        self.json_file = self.output_dir / "metrics.json"
+        self.history: list[dict[str, Any]] = []
+
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"\n{'=' * 105}\n")
+            f.write(f">> PHIÊN HUẤN LUYỆN TASDF: {exp_name.upper()} | KHỞI TẠO: {datetime.now().isoformat()}\n")
+            f.write(f"{'=' * 105}\n")
+
+    def log_header(self):
+        header = (
+            f"{'Epoch':<8} | {'GPU_Mem':<8} | {'L_total':<8} | {'L_sup':<8} | "
+            f"{'L_dist':<8} | {'Val_Acc':<8} | {'Val_Rec':<8} | {'Val_Dice':<9} | "
+            f"{'Val_IoU':<8} | {'ZP_Dice':<8} | {'TE_Dice':<8} | {'ICM_Dice':<8} | {'BC_Dice':<8}"
+        )
+        separator = "-" * len(header)
+        print("\n" + separator)
+        print(header)
+        print(separator)
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(separator + "\n" + header + "\n" + separator + "\n")
+
+    def _fmt_class(self, per_class: dict[str, float], key: str, short_key: str) -> str:
+        val = per_class.get(key, per_class.get(short_key))
+        if val is None:
+            return "N/A"
+        return f"{val * 100:.1f}%"
+
+    def log_epoch(self, metrics: dict[str, Any]):
+        epoch = metrics.get("epoch", 0)
+        total_epochs = metrics.get("total_epochs", 0)
+        epoch_str = f"{epoch:02d}/{total_epochs:02d}" if total_epochs else f"{epoch:02d}"
+
+        gpu_mem = 0.0
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        mem_str = f"{gpu_mem:.2f}G"
+
+        l_total = f"{metrics.get('train_total_loss', 0.0):.4f}"
+        l_sup = f"{metrics.get('train_loss_sup', 0.0):.4f}"
+        l_dist = f"{metrics.get('train_loss_distill', 0.0):.4f}"
+
+        val_acc = f"{metrics.get('val_mAccuracy', 0.0) * 100:.2f}%"
+        val_rec = f"{metrics.get('val_mRecall', 0.0) * 100:.2f}%"
+        val_dice = f"{metrics.get('val_mDice', 0.0) * 100:.2f}%"
+        val_iou = f"{metrics.get('val_mIoU', 0.0) * 100:.2f}%"
+
+        per_class = metrics.get("per_class_dice", {})
+        zp = self._fmt_class(per_class, "Zona Pellucida (ZP)", "ZP")
+        te = self._fmt_class(per_class, "Trophectoderm (TE)", "TE")
+        icm = self._fmt_class(per_class, "Inner Cell Mass (ICM)", "ICM")
+        bc = self._fmt_class(per_class, "Blastocyst Cavity (BC)", "BC")
+
+        row = (
+            f"{epoch_str:<8} | {mem_str:<8} | {l_total:<8} | {l_sup:<8} | "
+            f"{l_dist:<8} | {val_acc:<8} | {val_rec:<8} | {val_dice:<9} | "
+            f"{val_iou:<8} | {zp:<8} | {te:<8} | {icm:<8} | {bc:<8}"
+        )
+        print(row)
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(row + "\n")
+
+        record = metrics.copy()
+        record["timestamp"] = datetime.now().isoformat()
+        record["gpu_mem_gb"] = gpu_mem
+        self.history.append(record)
+
+        with open(self.json_file, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, indent=2)
+
+    def log_message(self, message: str):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted = f"[{timestamp}] {message}"
+        print(formatted)
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(formatted + "\n")
+==> ./tasdf/engine/__init__.py <==
+from .logger import DualLogger
+from .trainer import Trainer
+from .validator import Validator
+from .predictor import Predictor
+
+__all__ = ["DualLogger", "Trainer", "Validator", "Predictor"]
+
+==> ./tasdf/engine/trainer.py <==
+import os
+from pathlib import Path
+import shutil
+from typing import Any
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from tasdf.losses import MainLoss
+from tasdf.utils.metrics import (
+    get_model_parameter_stats,
+    format_parameter_summary,
+)
+from .logger import DualLogger
+
+
+class Trainer:
+    """Trình điều phối huấn luyện bán giám sát TASDF."""
+
+    def __init__(
+        self,
+        model: nn.Module,
+        cfg: dict[str, Any],
+        logger: DualLogger | None = None,
+        checkpoint_dir: str | Path | None = None,
+    ):
+        self.cfg = cfg
+        train_cfg = cfg.get("training", {})
+        loss_cfg = cfg.get("loss", {})
+        model_cfg = cfg.get("model", {})
+
+        req_device = train_cfg.get("device")
+        if req_device:
+            self.device = torch.device(req_device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.model = model.to(self.device)
+        self.use_amp = bool(train_cfg.get("amp", True) and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
+
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=float(train_cfg.get("learning_rate", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 5e-5)),
+        )
+
+        # Đồng bộ max_epochs giữa loss và training
+        configured_max_epochs = loss_cfg.get("max_epochs")
+        total_train_epochs = int(train_cfg.get("epochs", 2000))
+        effective_max_epochs = int(configured_max_epochs) if configured_max_epochs is not None else total_train_epochs
+
+        self.criterion = MainLoss(
+            lambda_topo=float(loss_cfg.get("lambda_topo", 0.10)),
+            gamma=float(loss_cfg.get("gamma", 0.5)),
+            alpha=float(loss_cfg.get("alpha", 1.0)),
+            max_epochs=effective_max_epochs,
+            omega_0=float(loss_cfg.get("omega_0", 1.0)),
+            omega_1=float(loss_cfg.get("omega_1", 1.0)),
+            topo_sup_weight=float(loss_cfg.get("topo_sup_weight", 0.10)),
+            k_iters=int(model_cfg.get("k_iters", 10)),
+        ).to(self.device)
+
+        ckpt_path = checkpoint_dir or train_cfg.get("checkpoint_dir", "checkpoints")
+        self.checkpoint_dir = Path(ckpt_path)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        configured_dir = train_cfg.get("checkpoint_dir")
+        self.root_checkpoint_dir = Path(configured_dir) if configured_dir else Path("checkpoints")
+
+        self.logger = logger or DualLogger(self.checkpoint_dir.parent / "logs")
+
+        self.start_epoch = 1
+        self.best_val_dice = 0.0
+        self.accum_steps = int(train_cfg.get("accum_steps", 1))
+        self.log_interval = int(train_cfg.get("log_interval", 20))
+
+    def save_checkpoint(self, epoch: int, is_best: bool = False, custom_name: str | None = None):
+        state = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scaler_state_dict": self.scaler.state_dict(),
+            "best_val_dice": self.best_val_dice,
+            "config": self.cfg,
+        }
+
+        last_file = self.checkpoint_dir / "last.pt"
+        torch.save(state, str(last_file))
+
+        for alias in ["latest.pt", "checkpoint_latest.pt"]:
+            alias_path = self.checkpoint_dir / alias
+            if alias_path.exists() or alias_path.is_symlink():
+                alias_path.unlink()
+            try:
+                os.link(str(last_file), str(alias_path))
+            except OSError:
+                shutil.copyfile(str(last_file), str(alias_path))
+
+        best_file = self.checkpoint_dir / "best.pt"
+        if is_best or not best_file.exists():
+            torch.save(state, str(best_file))
+            alias_best = self.checkpoint_dir / "checkpoint_best.pt"
+            if alias_best.exists() or alias_best.is_symlink():
+                alias_best.unlink()
+            try:
+                os.link(str(best_file), str(alias_best))
+            except OSError:
+                shutil.copyfile(str(best_file), str(alias_best))
+
+        target_dirs = []
+        if hasattr(self, "root_checkpoint_dir") and self.root_checkpoint_dir:
+            if self.root_checkpoint_dir.resolve() != self.checkpoint_dir.resolve():
+                target_dirs.append(self.root_checkpoint_dir)
+
+        sibling_name = "checkpoints" if self.checkpoint_dir.name == "weights" else "weights"
+        sibling_dir = self.checkpoint_dir.parent / sibling_name
+        if sibling_dir.resolve() != self.checkpoint_dir.resolve():
+            target_dirs.append(sibling_dir)
+
+        for out_dir in target_dirs:
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(str(last_file), str(out_dir / "last.pt"))
+                if best_file.exists():
+                    shutil.copyfile(str(best_file), str(out_dir / "best.pt"))
+            except Exception:
+                pass
+
+        if custom_name:
+            custom_file = self.checkpoint_dir / custom_name
+            torch.save(state, str(custom_file))
+
+    def load_checkpoint(self, checkpoint_path: str | Path, resume: bool = True):
+        path = Path(checkpoint_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Không tìm thấy checkpoint: {path}")
+
+        ckpt = torch.load(str(path), map_location=self.device, weights_only=False)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+
+        if resume:
+            if "optimizer_state_dict" in ckpt:
+                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scaler_state_dict" in ckpt and self.use_amp:
+                self.scaler.load_state_dict(ckpt["scaler_state_dict"])
+            self.start_epoch = ckpt.get("epoch", 0) + 1
+            self.best_val_dice = ckpt.get("best_val_dice", 0.0)
+            self.logger.log_message(
+                f">> Tiếp tục huấn luyện từ Epoch {self.start_epoch} (Best Dice trước đó: {self.best_val_dice * 100:.2f}%)"
+            )
+        else:
+            self.logger.log_message(f">> Đã nạp thành công trọng số mô hình từ {path}")
+
+    def train_one_epoch(
+        self,
+        labeled_loader: DataLoader,
+        unlabeled_loader: DataLoader,
+        epoch: int,
+    ) -> dict[str, float]:
+        self.model.train()
+        labeled_iter = iter(labeled_loader)
+        total_loss_accum, sup_accum, distill_accum, steps = 0.0, 0.0, 0.0, 0
+        total_steps = len(unlabeled_loader)
+
+        self.optimizer.zero_grad()
+
+        for step, x_u in enumerate(unlabeled_loader, 1):
+            try:
+                x_l, y_l = next(labeled_iter)
+            except StopIteration:
+                labeled_iter = iter(labeled_loader)
+                x_l, y_l = next(labeled_iter)
+
+            if isinstance(x_u, (tuple, list)):
+                x_u = x_u[0]
+
+            x_l, y_l = x_l.to(self.device), y_l.to(self.device)
+            x_u = x_u.to(self.device)
+
+            with torch.amp.autocast("cuda", enabled=self.use_amp):
+                (p1_l, t1_l), (p2_l, t2_l) = self.model(x_l, branch="both")
+                (p1_u, t1_u), (p2_u, t2_u) = self.model(x_u, branch="both")
+
+                loss, metrics = self.criterion(
+                    p1_l,
+                    p2_l,
+                    y_l,
+                    p1_u,
+                    p2_u,
+                    t1_u,
+                    t2_u,
+                    current_epoch=epoch,
+                    t1_labeled=t1_l,
+                    t2_labeled=t2_l,
+                )
+                loss_step = loss / self.accum_steps
+
+            self.scaler.scale(loss_step).backward()
+
+            if step % self.accum_steps == 0 or step == total_steps:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+
+            distill_val = metrics["loss_pc"] + self.criterion.lambda_topo * metrics["loss_tc"]
+            total_loss_accum += metrics["total_loss"]
+            sup_accum += metrics["loss_sup"]
+            distill_accum += distill_val
+            steps += 1
+
+        return {
+            "total_loss": total_loss_accum / max(1, steps),
+            "loss_sup": sup_accum / max(1, steps),
+            "loss_distill": distill_accum / max(1, steps),
+        }
+
+    def train(
+        self,
+        labeled_loader: DataLoader,
+        unlabeled_loader: DataLoader,
+        val_loader: DataLoader | None = None,
+        validator: Any | None = None,
+        epochs: int | None = None,
+    ) -> dict[str, Any]:
+        total_epochs = int(epochs or self.cfg.get("training", {}).get("epochs", 2000))
+        # Đồng bộ max_epochs của criterion nếu chưa bị khóa cứng
+        if self.cfg.get("loss", {}).get("max_epochs") is None:
+            self.criterion.max_epochs = total_epochs
+
+        param_stats = get_model_parameter_stats(self.model)
+        self.logger.log_message("\n" + format_parameter_summary(param_stats))
+
+        self.logger.log_message(
+            f"Bắt đầu huấn luyện: Epoch {self.start_epoch} -> {total_epochs} | Thiết bị: {self.device} | AMP: {self.use_amp}"
+        )
+        self.logger.log_header()
+
+        for epoch in range(self.start_epoch, total_epochs + 1):
+            train_metrics = self.train_one_epoch(labeled_loader, unlabeled_loader, epoch)
+
+            val_mAcc, val_mRec, val_mDice, val_mIoU = 0.0, 0.0, 0.0, 0.0
+            per_class_dice = {}
+            if validator:
+                val_res = validator.validate(self.model)
+                val_mAcc = val_res.get("mAccuracy", 0.0)
+                val_mRec = val_res.get("mRecall", 0.0)
+                val_mDice = val_res.get("mDice", 0.0)
+                val_mIoU = val_res.get("mIoU", 0.0)
+                per_class_dice = val_res.get("per_class_dice", {})
+
+            epoch_data = {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "train_total_loss": train_metrics["total_loss"],
+                "train_loss_sup": train_metrics["loss_sup"],
+                "train_loss_distill": train_metrics["loss_distill"],
+                "val_mAccuracy": val_mAcc,
+                "val_mRecall": val_mRec,
+                "val_mDice": val_mDice,
+                "val_mIoU": val_mIoU,
+                "per_class_dice": per_class_dice,
+            }
+            self.logger.log_epoch(epoch_data)
+
+            is_best = (val_mDice > self.best_val_dice) or (epoch == self.start_epoch)
+            if val_mDice > self.best_val_dice:
+                self.best_val_dice = val_mDice
+            self.save_checkpoint(epoch, is_best=is_best)
+
+        best_ckpt = self.checkpoint_dir / "best.pt"
+        last_ckpt = self.checkpoint_dir / "last.pt"
+        if not best_ckpt.exists() and last_ckpt.exists():
+            shutil.copyfile(str(last_ckpt), str(best_ckpt))
+
+        return {
+            "best_checkpoint": str(best_ckpt),
+            "last_checkpoint": str(last_ckpt),
+            "latest_checkpoint": str(last_ckpt),
+            "metrics_path": str(self.logger.json_file),
+            "best_val_dice": self.best_val_dice,
+        }
+==> ./tasdf/engine/validator.py <==
+from typing import Any
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from tasdf.utils.metrics import compute_sample_metrics, DEFAULT_CLASS_NAMES
+
+
+class Validator:
+    """
+    Động cơ đánh giá độc lập mô hình trên tập kiểm tra/kiểm định:
+    Tính toán đầy đủ 4 chỉ số theo bài báo TASDF: Accuracy, Recall, Dice, và Jaccard (IoU).
+    Tự động loại trừ các lớp không tồn tại trong ground-truth khỏi phép tính trung bình.
+    """
+
+    def __init__(
+        self,
+        val_loader: DataLoader,
+        device: torch.device | None = None,
+        class_names: dict[int, str] | None = None,
+        num_classes: int = 5,
+        branch: str = "net1",
+    ):
+        self.val_loader = val_loader
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.class_names = class_names or DEFAULT_CLASS_NAMES
+        self.num_classes = num_classes
+        self.branch = branch
+
+    def validate(self, model: nn.Module) -> dict[str, Any]:
+        """Thực hiện đánh giá trên toàn bộ val_loader."""
+        model.eval()
+        accum = {
+            c: {"accuracy": [], "recall": [], "dice": [], "iou": [], "present_count": 0}
+            for c in range(1, self.num_classes)
+        }
+
+        with torch.no_grad():
+            for x, y in self.val_loader:
+                x = x.to(self.device)
+                if self.branch == "ensemble":
+                    (p1, _), (p2, _) = model(x, branch="both")
+                    preds = (torch.softmax(p1, dim=1) + torch.softmax(p2, dim=1)) / 2.0
+                else:
+                    p, _ = model(x, branch=self.branch)
+                    preds = torch.softmax(p, dim=1)
+
+                pred_masks = torch.argmax(preds, dim=1).cpu().numpy()
+                target_masks = y.numpy()
+
+                for i in range(len(x)):
+                    sample_m = compute_sample_metrics(
+                        pred_masks[i], target_masks[i], num_classes=self.num_classes
+                    )
+                    for c in range(1, self.num_classes):
+                        if sample_m[c]["present"]:
+                            accum[c]["present_count"] += 1
+                        if sample_m[c]["active"]:
+                            accum[c]["accuracy"].append(sample_m[c]["accuracy"])
+                            accum[c]["recall"].append(sample_m[c]["recall"])
+                            accum[c]["dice"].append(sample_m[c]["dice"])
+                            accum[c]["iou"].append(sample_m[c]["iou"])
+
+        per_class_accuracy = {}
+        per_class_recall = {}
+        per_class_dice = {}
+        per_class_iou = {}
+
+        valid_classes = [c for c in range(1, self.num_classes) if accum[c]["present_count"] > 0]
+        if not valid_classes:
+            valid_classes = [c for c in range(1, self.num_classes) if len(accum[c]["dice"]) > 0]
+
+        for c in valid_classes:
+            name = self.class_names.get(c, DEFAULT_CLASS_NAMES.get(c, f"Class {c}"))
+            per_class_accuracy[name] = float(np.mean(accum[c]["accuracy"])) if accum[c]["accuracy"] else 0.0
+            per_class_recall[name] = float(np.mean(accum[c]["recall"])) if accum[c]["recall"] else 0.0
+            per_class_dice[name] = float(np.mean(accum[c]["dice"])) if accum[c]["dice"] else 0.0
+            per_class_iou[name] = float(np.mean(accum[c]["iou"])) if accum[c]["iou"] else 0.0
+
+        mean_acc = float(np.mean(list(per_class_accuracy.values()))) if per_class_accuracy else 0.0
+        mean_rec = float(np.mean(list(per_class_recall.values()))) if per_class_recall else 0.0
+        mean_dice = float(np.mean(list(per_class_dice.values()))) if per_class_dice else 0.0
+        mean_iou = float(np.mean(list(per_class_iou.values()))) if per_class_iou else 0.0
+
+        return {
+            "mAccuracy": mean_acc,
+            "mRecall": mean_rec,
+            "mDice": mean_dice,
+            "mIoU": mean_iou,
+            "per_class_accuracy": per_class_accuracy,
+            "per_class_recall": per_class_recall,
+            "per_class_dice": per_class_dice,
+            "per_class_iou": per_class_iou,
+        }
+
+    def print_results(self, results: dict[str, Any], title: str = "VAL"):
+        """In bảng kết quả đánh giá gồm 4 độ đo chuẩn của bài báo."""
+        print("\n" + "=" * 88)
+        print(f"  KẾT QUẢ ĐÁNH GIÁ ĐỘC LẬP | TẬP: [{title.upper()}] | NHÁNH: [{self.branch}]")
+        print("=" * 88)
+        print(
+            f"{'Cấu trúc Phôi học':<26} | {'Accuracy (%)':<13} | {'Recall (%)':<12} | "
+            f"{'Dice (%)':<12} | {'Jaccard/IoU (%)':<15}"
+        )
+        print("-" * 88)
+        for name, dice in results["per_class_dice"].items():
+            acc = results["per_class_accuracy"].get(name, 0.0)
+            rec = results["per_class_recall"].get(name, 0.0)
+            iou = results["per_class_iou"].get(name, 0.0)
+            print(
+                f"{name:<26} | {acc * 100:<13.2f} | {rec * 100:<12.2f} | "
+                f"{dice * 100:<12.2f} | {iou * 100:<15.2f}"
+            )
+        print("-" * 88)
+        print(
+            f"{'TRUNG BÌNH (MEAN)':<26} | {results['mAccuracy'] * 100:<13.2f} | "
+            f"{results['mRecall'] * 100:<12.2f} | {results['mDice'] * 100:<12.2f} | "
+            f"{results['mIoU'] * 100:<15.2f}"
+        )
+        print("=" * 88 + "\n")
+==> ./tasdf/utils/metrics.py <==
+from typing import Any
+import numpy as np
+import torch
+import torch.nn as nn
+
+DEFAULT_CLASS_NAMES = {
+    0: "Background",
+    1: "Zona Pellucida (ZP)",
+    2: "Trophectoderm (TE)",
+    3: "Inner Cell Mass (ICM)",
+    4: "Blastocyst Cavity (BC)",
+}
+
+DEFAULT_PALETTE = {
+    0: (0, 0, 0),        # 0: Background - Đen
+    1: (0, 114, 178),    # 1: ZP - Xanh lam
+    2: (0, 158, 115),    # 2: TE - Xanh lục
+    3: (213, 94, 0),     # 3: ICM - Cam đỏ
+    4: (240, 228, 66),   # 4: BC - Vàng
+}
+
+
+def compute_multiclass_dice(
+    preds: torch.Tensor, targets: torch.Tensor, num_classes: int = 5
+) -> float:
+    """
+    Tính mDice trên batch tensor (PyTorch), chỉ tính trung bình trên các lớp
+    thực sự xuất hiện trong targets hoặc được mô hình dự đoán (union > 0).
+    """
+    pred_classes = torch.argmax(preds, dim=1)
+    dice_scores = []
+    for c in range(1, num_classes):
+        pred_c = (pred_classes == c).float()
+        target_c = (targets == c).float()
+        intersection = (pred_c * target_c).sum()
+        total = pred_c.sum() + target_c.sum()
+        if total > 0:
+            dice_scores.append((2.0 * intersection / (total + 1e-6)).item())
+    return float(np.mean(dice_scores)) if dice_scores else 0.0
+
+
+def compute_sample_metrics(
+    pred_mask: np.ndarray, target_mask: np.ndarray, num_classes: int = 5
+) -> dict[int, dict[str, Any]]:
+    """
+    Tính toán 4 chỉ số đánh giá chuẩn theo Mục 4.3 bài báo TASDF cho từng lớp:
+    - Accuracy: (TP + TN) / (TP + TN + FP + FN)
+    - Recall:   TP / (TP + FN)
+    - Dice:     2 * TP / (2 * TP + FP + FN)
+    - IoU (Jaccard): TP / (TP + FP + FN)
+    Đồng thời ghi nhận cờ 'present' (target_sum > 0) và 'active' (union > 0)
+    để Validator loại trừ các lớp không tồn tại trong bộ dữ liệu.
+    """
+    metrics: dict[int, dict[str, Any]] = {}
+    total_pixels = float(pred_mask.size)
+
+    for c in range(1, num_classes):
+        p = pred_mask == c
+        t = target_mask == c
+
+        tp = float(np.logical_and(p, t).sum())
+        fp = float(np.logical_and(p, np.logical_not(t)).sum())
+        fn = float(np.logical_and(np.logical_not(p), t).sum())
+        tn = total_pixels - tp - fp - fn
+
+        target_sum = tp + fn
+        pred_sum = tp + fp
+        union = tp + fp + fn
+        denom_dice = 2.0 * tp + fp + fn
+
+        accuracy = (tp + tn) / total_pixels if total_pixels > 0 else 0.0
+        recall = (tp / (target_sum + 1e-6)) if target_sum > 0 else (1.0 if pred_sum == 0 else 0.0)
+        dice = (2.0 * tp / (denom_dice + 1e-6)) if denom_dice > 0 else 1.0
+        iou = (tp / (union + 1e-6)) if union > 0 else 1.0
+
+        metrics[c] = {
+            "accuracy": float(accuracy),
+            "recall": float(recall),
+            "dice": float(dice),
+            "iou": float(iou),
+            "present": bool(target_sum > 0),
+            "active": bool(union > 0),
+        }
+    return metrics
+
+
+def colorize_mask(
+    mask: np.ndarray, palette: dict[int, tuple[int, int, int]] | None = None
+) -> np.ndarray:
+    """Tô màu mặt nạ nhãn 2D theo bảng màu chuẩn RGB."""
+    if palette is None:
+        palette = DEFAULT_PALETTE
+    h, w = mask.shape
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    for class_id, color in palette.items():
+        color_mask[mask == class_id] = color
+    return color_mask
+
+
+def get_model_parameter_stats(model: nn.Module) -> dict[str, Any]:
+    """Tính toán chi tiết các chỉ số tham số mô hình."""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable = total_params - trainable_params
+    trainable_ratio = (trainable_params / total_params * 100.0) if total_params > 0 else 0.0
+    size_mb = (total_params * 4) / (1024 * 1024)
+
+    submodules = {}
+    for name, child in model.named_children():
+        c_total = sum(p.numel() for p in child.parameters())
+        c_trainable = sum(p.numel() for p in child.parameters() if p.requires_grad)
+        c_size_mb = (c_total * 4) / (1024 * 1024)
+        submodules[name] = {
+            "total_params": c_total,
+            "trainable_params": c_trainable,
+            "non_trainable_params": c_total - c_trainable,
+            "size_mb": c_size_mb,
+        }
+
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "non_trainable_params": non_trainable,
+        "trainable_ratio": trainable_ratio,
+        "size_mb": size_mb,
+        "submodules": submodules,
+    }
+
+
+def format_parameter_summary(stats: dict[str, Any]) -> str:
+    """Định dạng kết quả kiểm toán tham số thành bảng ASCII."""
+    lines = [
+        "=" * 78,
+        f"{'BẢNG THỐNG KÊ THAM SỐ MÔ HÌNH (MODEL PARAMETER AUDIT)':^78}",
+        "=" * 78,
+        f"  {'Thành phần / Module':<30} {'Tổng tham số':>15} {'Trainable':>15} {'Kích thước':>12}",
+        "-" * 78,
+    ]
+    for name, sub in stats.get("submodules", {}).items():
+        lines.append(
+            f"  {name:<30} {sub['total_params']:>15,d} {sub['trainable_params']:>15,d} {sub['size_mb']:>9.2f} MB"
+        )
+    if stats.get("submodules"):
+        lines.append("-" * 78)
+    lines.append(
+        f"  {'TỔNG CỘNG (TOTAL)':<30} {stats['total_params']:>15,d} {stats['trainable_params']:>15,d} {stats['size_mb']:>9.2f} MB"
+    )
+    lines.append(f"  * Tỷ lệ tham số huấn luyện: {stats.get('trainable_ratio', 0.0):.2f}%")
+    lines.append(f"  * Ước tính dung lượng bộ nhớ (FP32 weights): {stats.get('size_mb', 0.0):.2f} MB")
+    lines.append("=" * 78)
+    return "\n".join(lines)
+==> ./tasdf/utils/config.py <==
+from pathlib import Path
+from typing import Any
+import yaml
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "dataset": {
+        "format": "coco",
+        "path": "data/blastocyst_coco",
+        "train": "train",
+        "val": "valid",
+        "test": "test",
+        "image_size": 256,
+        "split_mode": "auto",  # 'auto', 'physical', hoặc 'ratio'
+        "labeled_ratio": 0.10,
+        "names": {
+            1: "Zona Pellucida (ZP)",
+            2: "Trophectoderm (TE)",
+            3: "Inner Cell Mass (ICM)",
+            4: "Blastocyst Cavity (BC)",
+        },
+    },
+    "augmentation": {
+        "enabled": True,
+        "random_rotation": True,
+        "max_rotation_deg": 30.0,
+        "random_scale_crop": True,
+        "scale_range": [0.85, 1.15],
+        "random_horizontal_flip": True,
+        "flip_prob": 0.5,
+        "color_jitter": True,
+        "brightness_delta": 0.15,
+        "contrast_range": [0.85, 1.15],
+        "gaussian_blur": True,
+        "blur_prob": 0.3,
+        "denoise": {
+            "enabled": False,
+            "method": "median",  # 'median', 'gaussian', hoặc 'clahe'
+            "kernel_size": 3,
+        },
+    },
+    "model": {
+        "in_channels": 1,
+        "base_channels": 64,
+        "num_classes": 5,
+        "k_iters": 10,
+    },
+    "loss": {
+        "omega_0": 1.0,
+        "omega_1": 1.0,
+        "lambda_topo": 0.10,
+        "gamma": 0.5,
+        "alpha": 1.0,
+        "topo_sup_weight": 0.10,  # Neo khung xương trên tập có nhãn để chống sụp đổ nghiệm
+        "max_epochs": None,       # Tự động đồng bộ theo training.epochs nếu để None
+    },
+    "training": {
+        "epochs": 100,
+        "batch_size": 4,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.00005,
+        "amp": True,
+        "accum_steps": 1,
+        "num_workers": 2,
+        "log_interval": 20,
+        "save_period": 1,
+    },
+}
+
+
+def load_yaml(path_or_str: str | Path) -> dict[str, Any]:
+    """Nạp file YAML an toàn."""
+    path = Path(path_or_str)
+    if not path.exists():
+        raise FileNotFoundError(f"Không tìm thấy file cấu hình: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data or {}
+
+
+def deep_merge(base: dict, update: dict) -> dict:
+    """Hợp nhất đệ quy 2 dictionary."""
+    result = base.copy()
+    for k, v in update.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def resolve_data_config(
+    data_input: str | Path | dict,
+    default_aug: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Chuẩn hóa cấu hình dữ liệu đầu vào, giữ nguyên các thiết lập chia tập và tăng cường dữ liệu.
+    """
+    if isinstance(data_input, (str, Path)):
+        p = Path(data_input)
+        raw_cfg = load_yaml(p)
+        base_dir = p.parent
+    elif isinstance(data_input, dict):
+        raw_cfg = data_input.copy()
+        base_dir = Path(".")
+    else:
+        raise TypeError(f"Dữ liệu cấu hình không hợp lệ: {type(data_input)}")
+
+    data_cfg = raw_cfg.get("dataset", raw_cfg)
+    aug_cfg = raw_cfg.get("augmentation", data_cfg.get("augmentation", default_aug or DEFAULT_CONFIG["augmentation"]))
+
+    data_path = Path(data_cfg.get("path") or data_cfg.get("root_dir", "."))
+    if not data_path.is_absolute():
+        data_path = (base_dir / data_path).resolve()
+
+    resolved: dict[str, Any] = {
+        "type": (data_cfg.get("format") or data_cfg.get("type", "coco")).lower(),
+        "root_dir": str(data_path),
+        "train": data_cfg.get("train", "train"),
+        "val": data_cfg.get("val") or data_cfg.get("valid", "valid"),
+        "test": data_cfg.get("test", "test"),
+        "image_size": int(data_cfg.get("image_size", 256)),
+        "names": data_cfg.get("names", DEFAULT_CONFIG["dataset"]["names"]),
+        "augmentation": deep_merge(DEFAULT_CONFIG["augmentation"], aug_cfg),
+    }
+
+    if "labeled_ratio" in data_cfg and data_cfg["labeled_ratio"] is not None:
+        resolved["labeled_ratio"] = float(data_cfg["labeled_ratio"])
+    if "split_mode" in data_cfg:
+        resolved["split_mode"] = str(data_cfg["split_mode"]).lower()
+    if "use_physical_split" in data_cfg:
+        resolved["use_physical_split"] = bool(data_cfg["use_physical_split"])
+
+    return resolved
+==> ./tasdf/utils/__init__.py <==
+from .metrics import (
+    compute_multiclass_dice,
+    compute_sample_metrics,
+    colorize_mask,
+    get_model_parameter_stats,
+    format_parameter_summary,
+    DEFAULT_CLASS_NAMES,
+    DEFAULT_PALETTE,
+)
+from .config import (
+    load_yaml,
+    deep_merge,
+    resolve_data_config,
+    DEFAULT_CONFIG,
+)
+
+__all__ = [
+    "compute_multiclass_dice",
+    "compute_sample_metrics",
+    "colorize_mask",
+    "get_model_parameter_stats",
+    "format_parameter_summary",
+    "DEFAULT_CLASS_NAMES",
+    "DEFAULT_PALETTE",
+    "load_yaml",
+    "deep_merge",
+    "resolve_data_config",
+    "DEFAULT_CONFIG",
+]
+==> ./tasdf/losses/losses.py <==
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tasdf.models.itgm import ITGM
+
+
+def sigmoid_rampup(current_epoch: int, max_epochs: int, alpha: float = 1.0) -> float:
+    """Hàm điều phối trọng số động Sigmoid Ramp-up w(t) theo Laine & Aila (2016)."""
+    if max_epochs <= 0:
+        return alpha
+    current = np.clip(current_epoch, 0, max_epochs)
+    phase = 1.0 - (current / max_epochs)
+    return float(alpha * np.exp(-5.0 * phase * phase))
+
+
+class MainLoss(nn.Module):
+    """
+    Hàm mất mát toàn thể TASDF (Mục 3.3):
+    - L_sup = omega_0 * CE(P1, Y) + omega_1 * CE(P2, Y) [+ neo khung xương tô-pô chống sụp đổ nghiệm]
+    - L_pc  = MSE(softmax(P1_u), softmax(P2_u))
+    - L_tc  = MSE(T1_u, T2_u)
+    - L_distillation = lambda * w(t) * L_tc + w(t) * L_pc
+    - L_total = gamma * L_sup + (1 - gamma) * L_distillation
+    """
+
+    def __init__(
+        self,
+        lambda_topo: float = 0.10,
+        gamma: float = 0.5,
+        alpha: float = 1.0,
+        max_epochs: int = 2000,
+        omega_0: float = 1.0,
+        omega_1: float = 1.0,
+        topo_sup_weight: float = 0.10,
+        k_iters: int = 10,
+    ):
+        super(MainLoss, self).__init__()
+        self.lambda_topo = lambda_topo
+        self.gamma = gamma
+        self.alpha = alpha
+        self.max_epochs = max_epochs
+        self.omega_0 = omega_0
+        self.omega_1 = omega_1
+        self.topo_sup_weight = topo_sup_weight
+        self.ce_loss = nn.CrossEntropyLoss()
+        self.target_itgm = ITGM(iterations=k_iters)
+
+    @torch.no_grad()
+    def _extract_target_skeleton(
+        self, targets: torch.Tensor, num_classes: int, target_channels: int
+    ) -> torch.Tensor:
+        """
+        Trích xuất khung xương chuẩn từ mặt nạ nhãn Y cho các lớp tiền cảnh (1..C-1)
+        để neo nhánh TopoHead không bị suy biến về 0.
+        """
+        one_hot = F.one_hot(targets.clamp(0, num_classes - 1), num_classes=num_classes)
+        # Chuyển về [B, C, H, W] và lấy các lớp tiền cảnh 1..C-1
+        one_hot_chw = one_hot.permute(0, 3, 1, 2).float()
+        fg_masks = one_hot_chw[:, 1:, :, :] if num_classes > 1 else one_hot_chw
+
+        if fg_masks.shape[1] != target_channels:
+            # Tương thích ngược nếu bài test truyền t_labeled có 1 kênh gộp
+            fg_union = (targets > 0).unsqueeze(1).float()
+            fg_masks = fg_union.expand(-1, target_channels, -1, -1)
+
+        target_skel = self.target_itgm(fg_masks) * fg_masks
+        return target_skel
+
+    def forward(
+        self,
+        p1_labeled: torch.Tensor,
+        p2_labeled: torch.Tensor,
+        targets_labeled: torch.Tensor,
+        p1_unlabeled: torch.Tensor,
+        p2_unlabeled: torch.Tensor,
+        t1_unlabeled: torch.Tensor,
+        t2_unlabeled: torch.Tensor,
+        current_epoch: int,
+        t1_labeled: torch.Tensor | None = None,
+        t2_labeled: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        # 1. Tổn thất có giám sát mức điểm ảnh (Phương trình 8)
+        loss_ce1 = self.ce_loss(p1_labeled, targets_labeled)
+        loss_ce2 = self.ce_loss(p2_labeled, targets_labeled)
+        loss_sup = self.omega_0 * loss_ce1 + self.omega_1 * loss_ce2
+
+        # Neo giám sát khung xương tô-pô trên tập có nhãn để chống Mode Collapse cho TopoHead
+        loss_topo_sup_val = 0.0
+        if self.topo_sup_weight > 0.0 and t1_labeled is not None and t2_labeled is not None:
+            num_classes = p1_labeled.shape[1]
+            target_skel = self._extract_target_skeleton(
+                targets_labeled, num_classes=num_classes, target_channels=t1_labeled.shape[1]
+            )
+            loss_topo_sup = F.mse_loss(t1_labeled, target_skel) + F.mse_loss(t2_labeled, target_skel)
+            loss_sup = loss_sup + self.topo_sup_weight * loss_topo_sup
+            loss_topo_sup_val = loss_topo_sup.item()
+
+        # 2. Tổn thất nhất quán mức điểm ảnh trên dữ liệu không nhãn (Phương trình 9)
+        prob1_unlabeled = F.softmax(p1_unlabeled, dim=1)
+        prob2_unlabeled = F.softmax(p2_unlabeled, dim=1)
+        loss_pc = F.mse_loss(prob1_unlabeled, prob2_unlabeled)
+
+        # 3. Tổn thất nhất quán mức tô-pô trên dữ liệu không nhãn (Phương trình 10)
+        loss_tc = F.mse_loss(t1_unlabeled, t2_unlabeled)
+
+        # 4. Tổn thất tự chưng cất và Tổng tổn thất (Phương trình 11 & 12)
+        w_t = sigmoid_rampup(current_epoch, self.max_epochs, self.alpha)
+        loss_distill = self.lambda_topo * w_t * loss_tc + w_t * loss_pc
+
+        total_loss = self.gamma * loss_sup + (1.0 - self.gamma) * loss_distill
+
+        metrics = {
+            "total_loss": total_loss.item(),
+            "loss_sup": loss_sup.item(),
+            "loss_topo_sup": loss_topo_sup_val,
+            "loss_pc": loss_pc.item(),
+            "loss_tc": loss_tc.item(),
+            "w_t": w_t,
+        }
+        return total_loss, metrics
+==> ./tasdf/losses/__init__.py <==
+from .losses import MainLoss, sigmoid_rampup
+
+__all__ = ["MainLoss", "sigmoid_rampup"]
+
+==> ./tasdf/api.py <==
+from pathlib import Path
+from typing import Any
+import torch
+from torch.utils.data import DataLoader, Subset
+
+from tasdf.models import TASDFNet
+from tasdf.engine import Trainer, Validator, Predictor, DualLogger
+from tasdf.data import build_dataloaders, build_dataset
+from tasdf.utils import (
+    DEFAULT_CONFIG,
+    deep_merge,
+    load_yaml,
+    resolve_data_config,
+    get_model_parameter_stats,
+    format_parameter_summary,
+)
+
+
+class TASDF:
+    """Điểm truy cập chính cho việc huấn luyện, đánh giá và suy luận mô hình TASDF."""
+
+    def __init__(
+        self,
+        model: str | Path | dict | None = None,
+        task: str = "segment",
+    ):
+        self.task = task
+        self.cfg = DEFAULT_CONFIG.copy()
+        self.checkpoint_info = None
+
+        model_kwargs = self.cfg["model"].copy()
+
+        if model is not None:
+            if isinstance(model, dict):
+                self.cfg = deep_merge(self.cfg, model)
+                model_kwargs = self.cfg.get("model", model_kwargs)
+            else:
+                m_path = Path(model)
+                if m_path.suffix in (".yaml", ".yml"):
+                    user_yaml = load_yaml(m_path)
+                    self.cfg = deep_merge(self.cfg, user_yaml)
+                    model_kwargs = self.cfg.get("model", model_kwargs)
+                elif m_path.suffix == ".pt":
+                    ckpt = torch.load(str(m_path), map_location="cpu", weights_only=False)
+                    if "config" in ckpt:
+                        self.cfg = deep_merge(self.cfg, ckpt["config"])
+                        model_kwargs = self.cfg.get("model", model_kwargs)
+                    self.checkpoint_info = m_path
+
+        self.model = TASDFNet(
+            in_channels=model_kwargs.get("in_channels", 1),
+            base_channels=model_kwargs.get("base_channels", 64),
+            num_classes=model_kwargs.get("num_classes", 5),
+            k_iters=model_kwargs.get("k_iters", 10),
+        )
+
+        if self.checkpoint_info is not None:
+            ckpt = torch.load(str(self.checkpoint_info), map_location="cpu", weights_only=False)
+            state_dict = ckpt.get("model_state_dict", ckpt)
+            self.model.load_state_dict(state_dict)
+
+    def _get_unique_exp_dir(self, project: str | Path, name: str) -> Path:
+        base = Path(project)
+        target = base / name
+        if not target.exists():
+            return target
+        idx = 2
+        while (base / f"{name}{idx}").exists():
+            idx += 1
+        return base / f"{name}{idx}"
+
+    def train(
+        self,
+        data: str | Path | dict,
+        epochs: int = 2000,
+        batch: int = 4,
+        imgsz: int = 256,
+        lr: float = 1e-4,
+        device: str | None = None,
+        amp: bool = True,
+        accum_steps: int = 1,
+        project: str = "runs/train",
+        name: str = "exp",
+        resume: bool = False,
+        num_workers: int = 2,
+        seed: int = 42,
+        augment: bool | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        data_cfg = resolve_data_config(data, default_aug=self.cfg.get("augmentation"))
+        data_cfg["image_size"] = imgsz
+        if augment is not None:
+            data_cfg["augmentation"]["enabled"] = bool(augment)
+
+        train_overrides = {
+            "training": {
+                "epochs": epochs,
+                "batch_size": batch,
+                "learning_rate": lr,
+                "device": device,
+                "amp": amp,
+                "accum_steps": accum_steps,
+                "num_workers": num_workers,
+            },
+            "loss": {
+                "max_epochs": epochs,
+            },
+        }
+        train_overrides["training"].update(kwargs)
+        self.cfg = deep_merge(self.cfg, train_overrides)
+
+        exp_dir = self._get_unique_exp_dir(project, name)
+        logger = DualLogger(output_dir=exp_dir, exp_name=exp_dir.name)
+        ckpt_dir = exp_dir / "checkpoints"
+
+        labeled_loader, unlabeled_loader, val_loader = build_dataloaders(
+            data_cfg=data_cfg,
+            batch_size=batch,
+            num_workers=num_workers,
+            pin_memory=True,
+            seed=seed,
+        )
+
+        dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        validator = Validator(
+            val_loader=val_loader,
+            device=dev,
+            class_names=data_cfg.get("names"),
+            num_classes=self.cfg["model"]["num_classes"],
+        )
+
+        trainer = Trainer(
+            model=self.model,
+            cfg=self.cfg,
+            logger=logger,
+            checkpoint_dir=ckpt_dir,
+        )
+
+        if resume and self.checkpoint_info:
+            trainer.load_checkpoint(self.checkpoint_info, resume=True)
+
+        results = trainer.train(
+            labeled_loader=labeled_loader,
+            unlabeled_loader=unlabeled_loader,
+            val_loader=val_loader,
+            validator=validator,
+            epochs=epochs,
+        )
+        results["exp_dir"] = str(exp_dir)
+        return results
+
+    def val(
+        self,
+        data: str | Path | dict,
+        split: str = "val",
+        batch: int = 4,
+        imgsz: int = 256,
+        device: str | None = None,
+        branch: str = "net1",
+        **kwargs,
+    ) -> dict[str, Any]:
+        data_cfg = resolve_data_config(data, default_aug=self.cfg.get("augmentation"))
+        data_cfg["image_size"] = imgsz
+
+        val_ds = build_dataset(data_cfg, split=split, is_labeled=True, is_train=False)
+        avail_labeled = getattr(val_ds, "labeled_indices", list(range(len(val_ds))))
+        val_subset = Subset(val_ds, avail_labeled) if len(avail_labeled) < len(val_ds) else val_ds
+        loader = DataLoader(val_subset, batch_size=batch, shuffle=False)
+
+        dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(dev)
+        validator = Validator(
+            val_loader=loader,
+            device=dev,
+            class_names=data_cfg.get("names"),
+            num_classes=self.cfg["model"]["num_classes"],
+            branch=branch,
+        )
+        res = validator.validate(self.model)
+        validator.print_results(res, title=split)
+        return res
+
+    def predict(
+        self,
+        source: str | Path | list[Path],
+        imgsz: int = 256,
+        save: bool = True,
+        output_dir: str | Path = "runs/predict",
+        device: str | None = None,
+        branch: str = "net1",
+        **kwargs,
+    ) -> list[dict[str, Any]]:
+        dev = torch.device(device) if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(dev)
+        predictor = Predictor(
+            image_size=imgsz,
+            device=dev,
+            branch=branch,
+        )
+        return predictor.predict(self.model, source=source, output_dir=output_dir, save=save)
+
+    def info(self, detailed: bool = True) -> dict[str, Any]:
+        stats = get_model_parameter_stats(self.model)
+        if detailed:
+            print(format_parameter_summary(stats))
+        return stats
+==> ./tasdf/__init__.py <==
+from tasdf.api import TASDF
+
+__version__ = "0.1.0"
+
+__all__ = ["TASDF", "__version__"]

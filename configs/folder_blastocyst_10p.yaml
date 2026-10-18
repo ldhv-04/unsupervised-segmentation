@@ -1,0 +1,48 @@
+dataset:
+  format: folder
+  path: data/blastocyst_10p
+  train: train
+  val: valid
+  image_size: 256
+  split_mode: physical
+  names:
+    1: "Zona Pellucida (ZP)"
+    2: "Trophectoderm (TE)"
+    3: "Inner Cell Mass (ICM)"
+    4: "Blastocyst Cavity (BC)"
+
+augmentation:
+  enabled: true
+  random_rotation: true
+  max_rotation_deg: 30.0
+  random_scale_crop: true
+  scale_range: [0.85, 1.15]
+  random_horizontal_flip: true
+  flip_prob: 0.5
+  color_jitter: true
+  gaussian_blur: true
+  denoise:
+    enabled: true
+    method: median
+    kernel_size: 3
+
+model:
+  in_channels: 1
+  base_channels: 64
+  num_classes: 4
+  k_iters: 10
+
+loss:
+  omega_0: 1.0
+  omega_1: 1.0
+  lambda_topo: 0.10
+  gamma: 0.5
+  alpha: 1.0
+  topo_sup_weight: 0.10
+
+training:
+  epochs: 2000
+  batch_size: 4
+  learning_rate: 0.0001
+  weight_decay: 0.00005
+  amp: true

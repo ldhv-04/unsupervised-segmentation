@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader
 
 from tasdf.losses import MainLoss
 from tasdf.utils.metrics import (
-    compute_multiclass_dice,
     get_model_parameter_stats,
     format_parameter_summary,
 )
@@ -16,13 +15,7 @@ from .logger import DualLogger
 
 
 class Trainer:
-    """
-    Trình điều phối huấn luyện bán giám sát TASDF:
-    - Hỗ trợ Automatic Mixed Precision (AMP FP16)
-    - Tích hợp Gradient Accumulation
-    - Lưu và khôi phục trạng thái toàn vẹn (Fault-Tolerant Checkpointing)
-    - Giám sát kép Text + JSON
-    """
+    """Trình điều phối huấn luyện bán giám sát TASDF."""
 
     def __init__(
         self,
@@ -34,8 +27,8 @@ class Trainer:
         self.cfg = cfg
         train_cfg = cfg.get("training", {})
         loss_cfg = cfg.get("loss", {})
+        model_cfg = cfg.get("model", {})
 
-        # 1. Cấu hình thiết bị & AMP
         req_device = train_cfg.get("device")
         if req_device:
             self.device = torch.device(req_device)
@@ -46,43 +39,43 @@ class Trainer:
         self.use_amp = bool(train_cfg.get("amp", True) and self.device.type == "cuda")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
-        # 2. Tối ưu hóa & Hàm mất mát
         self.optimizer = torch.optim.Adam(
             self.model.parameters(),
             lr=float(train_cfg.get("learning_rate", 1e-4)),
             weight_decay=float(train_cfg.get("weight_decay", 5e-5)),
         )
+
+        # Đồng bộ max_epochs giữa loss và training
+        configured_max_epochs = loss_cfg.get("max_epochs")
+        total_train_epochs = int(train_cfg.get("epochs", 2000))
+        effective_max_epochs = int(configured_max_epochs) if configured_max_epochs is not None else total_train_epochs
+
         self.criterion = MainLoss(
             lambda_topo=float(loss_cfg.get("lambda_topo", 0.10)),
             gamma=float(loss_cfg.get("gamma", 0.5)),
             alpha=float(loss_cfg.get("alpha", 1.0)),
-            max_epochs=int(loss_cfg.get("max_epochs", 50)),
-        )
+            max_epochs=effective_max_epochs,
+            omega_0=float(loss_cfg.get("omega_0", 1.0)),
+            omega_1=float(loss_cfg.get("omega_1", 1.0)),
+            topo_sup_weight=float(loss_cfg.get("topo_sup_weight", 0.10)),
+            k_iters=int(model_cfg.get("k_iters", 10)),
+        ).to(self.device)
 
-        # 3. Thư mục checkpoint & nhật ký
         ckpt_path = checkpoint_dir or train_cfg.get("checkpoint_dir", "checkpoints")
         self.checkpoint_dir = Path(ckpt_path)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        # Thư mục gốc bổ sung (đồng bộ ra checkpoints/ toàn cục nếu người dùng cấu hình)
         configured_dir = train_cfg.get("checkpoint_dir")
         self.root_checkpoint_dir = Path(configured_dir) if configured_dir else Path("checkpoints")
 
         self.logger = logger or DualLogger(self.checkpoint_dir.parent / "logs")
 
-        # 4. Trạng thái vòng đời
         self.start_epoch = 1
         self.best_val_dice = 0.0
         self.accum_steps = int(train_cfg.get("accum_steps", 1))
         self.log_interval = int(train_cfg.get("log_interval", 20))
 
     def save_checkpoint(self, epoch: int, is_best: bool = False, custom_name: str | None = None):
-        """
-        Lưu trạng thái toàn diện vào file checkpoint.
-        Đảm bảo luôn xuất 2 checkpoint chuẩn:
-          1. best.pt: Trọng số mô hình có điểm validation tốt nhất (hoặc epoch 1).
-          2. last.pt: Trọng số mô hình ở epoch gần nhất.
-        """
         state = {
             "epoch": epoch,
             "model_state_dict": self.model.state_dict(),
@@ -92,11 +85,9 @@ class Trainer:
             "config": self.cfg,
         }
 
-        # 1. Luôn lưu last.pt ở mỗi epoch
         last_file = self.checkpoint_dir / "last.pt"
         torch.save(state, str(last_file))
 
-        # Lưu alias tương thích ngược (latest.pt, checkpoint_latest.pt)
         for alias in ["latest.pt", "checkpoint_latest.pt"]:
             alias_path = self.checkpoint_dir / alias
             if alias_path.exists() or alias_path.is_symlink():
@@ -106,7 +97,6 @@ class Trainer:
             except OSError:
                 shutil.copyfile(str(last_file), str(alias_path))
 
-        # 2. Lưu best.pt nếu đạt kỷ lục hoặc lần lưu đầu tiên
         best_file = self.checkpoint_dir / "best.pt"
         if is_best or not best_file.exists():
             torch.save(state, str(best_file))
@@ -118,13 +108,11 @@ class Trainer:
             except OSError:
                 shutil.copyfile(str(best_file), str(alias_best))
 
-        # 3. Đồng bộ best.pt và last.pt sang các thư mục đích bổ sung
         target_dirs = []
         if hasattr(self, "root_checkpoint_dir") and self.root_checkpoint_dir:
             if self.root_checkpoint_dir.resolve() != self.checkpoint_dir.resolve():
                 target_dirs.append(self.root_checkpoint_dir)
 
-        # Nếu checkpoint_dir là 'weights', đồng bộ thêm sang 'checkpoints' cùng cấp và ngược lại
         sibling_name = "checkpoints" if self.checkpoint_dir.name == "weights" else "weights"
         sibling_dir = self.checkpoint_dir.parent / sibling_name
         if sibling_dir.resolve() != self.checkpoint_dir.resolve():
@@ -144,7 +132,6 @@ class Trainer:
             torch.save(state, str(custom_file))
 
     def load_checkpoint(self, checkpoint_path: str | Path, resume: bool = True):
-        """Nạp checkpoint và khôi phục trạng thái huấn luyện."""
         path = Path(checkpoint_path)
         if not path.exists():
             raise FileNotFoundError(f"Không tìm thấy checkpoint: {path}")
@@ -171,7 +158,6 @@ class Trainer:
         unlabeled_loader: DataLoader,
         epoch: int,
     ) -> dict[str, float]:
-        """Huấn luyện một epoch đơn lẻ."""
         self.model.train()
         labeled_iter = iter(labeled_loader)
         total_loss_accum, sup_accum, distill_accum, steps = 0.0, 0.0, 0.0, 0
@@ -186,15 +172,27 @@ class Trainer:
                 labeled_iter = iter(labeled_loader)
                 x_l, y_l = next(labeled_iter)
 
+            if isinstance(x_u, (tuple, list)):
+                x_u = x_u[0]
+
             x_l, y_l = x_l.to(self.device), y_l.to(self.device)
             x_u = x_u.to(self.device)
 
             with torch.amp.autocast("cuda", enabled=self.use_amp):
-                (p1_l, _), (p2_l, _) = self.model(x_l, branch="both")
+                (p1_l, t1_l), (p2_l, t2_l) = self.model(x_l, branch="both")
                 (p1_u, t1_u), (p2_u, t2_u) = self.model(x_u, branch="both")
 
                 loss, metrics = self.criterion(
-                    p1_l, p2_l, y_l, p1_u, p2_u, t1_u, t2_u, current_epoch=epoch
+                    p1_l,
+                    p2_l,
+                    y_l,
+                    p1_u,
+                    p2_u,
+                    t1_u,
+                    t2_u,
+                    current_epoch=epoch,
+                    t1_labeled=t1_l,
+                    t2_labeled=t2_l,
                 )
                 loss_step = loss / self.accum_steps
 
@@ -225,10 +223,11 @@ class Trainer:
         validator: Any | None = None,
         epochs: int | None = None,
     ) -> dict[str, Any]:
-        """Vòng lặp huấn luyện chính."""
-        total_epochs = epochs or self.cfg.get("training", {}).get("epochs", 30)
+        total_epochs = int(epochs or self.cfg.get("training", {}).get("epochs", 2000))
+        # Đồng bộ max_epochs của criterion nếu chưa bị khóa cứng
+        if self.cfg.get("loss", {}).get("max_epochs") is None:
+            self.criterion.max_epochs = total_epochs
 
-        # 1. Thống kê và hiển thị số lượng tham số trước khi huấn luyện
         param_stats = get_model_parameter_stats(self.model)
         self.logger.log_message("\n" + format_parameter_summary(param_stats))
 
@@ -240,26 +239,30 @@ class Trainer:
         for epoch in range(self.start_epoch, total_epochs + 1):
             train_metrics = self.train_one_epoch(labeled_loader, unlabeled_loader, epoch)
 
-            val_mDice = 0.0
+            val_mAcc, val_mRec, val_mDice, val_mIoU = 0.0, 0.0, 0.0, 0.0
             per_class_dice = {}
             if validator:
                 val_res = validator.validate(self.model)
+                val_mAcc = val_res.get("mAccuracy", 0.0)
+                val_mRec = val_res.get("mRecall", 0.0)
                 val_mDice = val_res.get("mDice", 0.0)
+                val_mIoU = val_res.get("mIoU", 0.0)
                 per_class_dice = val_res.get("per_class_dice", {})
 
-            # Tổng hợp metrics gửi logger
             epoch_data = {
                 "epoch": epoch,
                 "total_epochs": total_epochs,
                 "train_total_loss": train_metrics["total_loss"],
                 "train_loss_sup": train_metrics["loss_sup"],
                 "train_loss_distill": train_metrics["loss_distill"],
+                "val_mAccuracy": val_mAcc,
+                "val_mRecall": val_mRec,
                 "val_mDice": val_mDice,
+                "val_mIoU": val_mIoU,
                 "per_class_dice": per_class_dice,
             }
             self.logger.log_epoch(epoch_data)
 
-            # Cập nhật checkpoint: Epoch đầu tiên hoặc khi mDice cải thiện đều lưu best
             is_best = (val_mDice > self.best_val_dice) or (epoch == self.start_epoch)
             if val_mDice > self.best_val_dice:
                 self.best_val_dice = val_mDice

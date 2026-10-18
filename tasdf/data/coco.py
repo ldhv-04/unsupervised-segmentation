@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Any
 import cv2
 import numpy as np
 import torch
@@ -9,7 +10,6 @@ from .base import BaseEmbryoDataset
 class COCOEmbryoDataset(BaseEmbryoDataset):
     """
     Bộ nạp dữ liệu phôi nang từ định dạng COCO Segmentation JSON.
-    Hỗ trợ linh hoạt cấu trúc thư mục từ Roboflow hoặc COCO chuẩn.
     """
 
     def __init__(
@@ -19,12 +19,15 @@ class COCOEmbryoDataset(BaseEmbryoDataset):
         size: int = 256,
         is_labeled: bool = True,
         class_mapping: dict[str, int] | None = None,
+        aug_cfg: dict[str, Any] | None = None,
+        is_train: bool | None = None,
     ):
-        super().__init__(size=size, is_labeled=is_labeled)
+        if is_train is None:
+            is_train = split.lower() == "train"
+        super().__init__(size=size, is_labeled=is_labeled, aug_cfg=aug_cfg, is_train=is_train)
         self.root_path = Path(root_dir)
         self.split = split
 
-        # Tự động tìm kiếm file nhãn COCO
         candidates = [
             self.root_path / split / "_annotations.coco.json",
             self.root_path / split / "annotations.json",
@@ -47,26 +50,36 @@ class COCOEmbryoDataset(BaseEmbryoDataset):
             self.coco = json.load(f)
 
         self.img_dir = json_path.parent
-        self.images = self.coco["images"]
-        self.cat_id_to_name = {cat["id"]: cat["name"] for cat in self.coco["categories"]}
+        self.images = self.coco.get("images", [])
+        self.cat_id_to_name = {cat["id"]: cat["name"] for cat in self.coco.get("categories", [])}
 
-        # Lập chỉ mục: image_id -> danh sách annotations
-        self.img_id_to_anns = {}
+        self.img_id_to_anns: dict[int, list[dict[str, Any]]] = {}
         for ann in self.coco.get("annotations", []):
-            self.img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
+            if ann.get("segmentation"):
+                self.img_id_to_anns.setdefault(ann["image_id"], []).append(ann)
 
         self.class_mapping = class_mapping
+
+        # Phân loại rõ chỉ số ảnh có nhãn và không nhãn thực tế
+        self.labeled_indices: list[int] = []
+        self.unlabeled_indices: list[int] = []
+        for idx, img_info in enumerate(self.images):
+            if len(self.img_id_to_anns.get(img_info["id"], [])) > 0:
+                self.labeled_indices.append(idx)
+            else:
+                self.unlabeled_indices.append(idx)
 
     def _map_category_to_class_id(self, cat_name: str) -> int:
         if self.class_mapping and cat_name in self.class_mapping:
             return self.class_mapping[cat_name]
-        if "ZP" in cat_name:
+        name_upper = cat_name.upper()
+        if "ZP" in name_upper or "ZONA" in name_upper:
             return 1
-        elif "TE" in cat_name:
+        elif "TE" in name_upper or "TROPHECTODERM" in name_upper:
             return 2
-        elif "ICM" in cat_name:
+        elif "ICM" in name_upper or "INNER" in name_upper:
             return 3
-        elif "Blastocyst" in cat_name:
+        elif "BC" in name_upper or "BLASTOCOEL" in name_upper or "CAVITY" in name_upper or "BLASTOCYST" in name_upper:
             return 4
         return 0
 
@@ -74,20 +87,17 @@ class COCOEmbryoDataset(BaseEmbryoDataset):
         mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
         def draw_priority(ann):
-            name = self.cat_id_to_name.get(ann["category_id"], "")
-            if "Blastocyst" in name:
-                return 0
-            if "ZP" in name:
-                return 1
-            if "TE" in name:
-                return 2
-            return 3
+            cid = self._map_category_to_class_id(self.cat_id_to_name.get(ann["category_id"], ""))
+            # Vẽ khoang/lớp nền trước, ZP -> TE -> ICM sau để không đè mất cấu trúc nhỏ
+            priority_map = {4: 0, 1: 1, 2: 2, 3: 3}
+            return priority_map.get(cid, 0)
 
         sorted_anns = sorted(anns, key=draw_priority)
         for ann in sorted_anns:
             cat_name = self.cat_id_to_name.get(ann["category_id"], "")
             class_id = self._map_category_to_class_id(cat_name)
-
+            if class_id <= 0:
+                continue
             for seg in ann.get("segmentation", []):
                 poly = np.array(seg, dtype=np.int32).reshape(-1, 2)
                 cv2.fillPoly(mask, [poly], color=class_id)
@@ -100,18 +110,20 @@ class COCOEmbryoDataset(BaseEmbryoDataset):
         img_info = self.images[idx]
         img_path = self.img_dir / img_info["file_name"]
         if not img_path.exists():
-            # Thử tìm trong root_path
             img_path = self.root_path / img_info["file_name"]
 
-        img_tensor = self.preprocess_image(str(img_path))
         if not self.is_labeled:
-            return img_tensor
+            return self.preprocess_image(str(img_path))
 
         anns = self.img_id_to_anns.get(img_info["id"], [])
+        if not anns:
+            raise ValueError(
+                f"Ảnh '{img_info['file_name']}' (id={img_info['id']}) không có nhãn annotation. "
+                f"Không được phép nạp mẫu không nhãn vào luồng có giám sát (is_labeled=True)."
+            )
+
         orig_w = img_info.get("width", self.size)
         orig_h = img_info.get("height", self.size)
         mask_np = self._rasterize_polygons(anns, orig_w, orig_h)
-        mask_resized = cv2.resize(
-            mask_np, (self.size, self.size), interpolation=cv2.INTER_NEAREST
-        )
-        return img_tensor, torch.tensor(mask_resized, dtype=torch.long)
+        img_tensor, mask_tensor = self.preprocess_pair(str(img_path), mask_np)
+        return img_tensor, mask_tensor
