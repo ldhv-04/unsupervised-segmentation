@@ -87,6 +87,8 @@ class TASDF:
         augment: bool | None = None,
         **kwargs,
     ) -> dict[str, Any]:
+        if data is None or str(data).lower() == "none":
+            data = self.cfg
         data_cfg = resolve_data_config(data, default_aug=self.cfg.get("augmentation"))
         data_cfg["image_size"] = imgsz
         if augment is not None:
@@ -159,7 +161,9 @@ class TASDF:
         branch: str = "net1",
         **kwargs,
     ) -> dict[str, Any]:
-        data_cfg = resolve_data_config(data, default_aug=self.cfg.get("augmentation"))
+        if data is None or str(data).lower() == "none":
+            data = self.cfg
+        data_cfg = resolve_data_config(data, default_aug=self.cfg.get("augmentation"))        
         data_cfg["image_size"] = imgsz
 
         val_ds = build_dataset(data_cfg, split=split, is_labeled=True, is_train=False)

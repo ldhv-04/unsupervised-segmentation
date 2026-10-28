@@ -10,7 +10,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="TASDF Semi-Supervised Training CLI")
     parser.add_argument("--config", type=str, default="configs/coco_blastocyst.yaml", help="Path to YAML config")
     parser.add_argument("--model", type=str, default=None, help="Model YAML or checkpoint .pt")
-    parser.add_argument("--data", type=str, default=None, help="Dataset YAML path or directory")
+    parser.add_argument("--data", type=str, default="None", help="Dataset YAML path or directory")
     parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs")
     parser.add_argument("--batch", type=int, default=None, help="Batch size")
     parser.add_argument("--imgsz", type=int, default=None, help="Image size")
@@ -34,7 +34,9 @@ def main():
         model.info(detailed=True)
         return
 
-    data_src = args.data or model.cfg.get("dataset", {})
+    # Nếu không truyền --data riêng, truyền trực tiếp đường dẫn file --config
+    # để resolve_data_config định vị đúng thư mục gốc chứa file YAML
+    data_src = args.data if (args.data and str(args.data).lower() != "none") else args.config
 
     kwargs = {}
     if args.epochs is not None:

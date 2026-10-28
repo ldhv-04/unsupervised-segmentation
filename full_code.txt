@@ -1575,7 +1575,7 @@ def parse_args():
     )
     parser.add_argument("--output_dir", type=str, required=True, help="Thư mục xuất dữ liệu đầu ra")
     parser.add_argument("--labeled_ratio", type=float, default=0.10, help="Tỷ lệ giữ nhãn tập train (mặc định: 0.10)")
-    parser.add_argument("--val_ratio", type=float, default=0.15, help="Tỷ lệ tách tập valid nếu không chia sẵn theo JSON")
+    parser.add_argument("--val_ratio", type=float, default=0.10, help="Tỷ lệ tách tập valid nếu không chia sẵn theo JSON")
     parser.add_argument("--seed", type=int, default=42, help="Random seed cố định")
     return parser.parse_args()
 
@@ -3090,11 +3090,18 @@ class DualLogger:
         with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(separator + "\n" + header + "\n" + separator + "\n")
 
-    def _fmt_class(self, per_class: dict[str, float], key: str, short_key: str) -> str:
-        val = per_class.get(key, per_class.get(short_key))
-        if val is None:
-            return "N/A"
-        return f"{val * 100:.1f}%"
+    def _fmt_class(self, per_class: dict[str, float], *candidates: str) -> str:
+        # 1. Khớp chính xác
+        for key in candidates:
+            if key in per_class and per_class[key] is not None:
+                return f"{per_class[key] * 100:.1f}%"
+        # 2. Khớp từ khóa con không phân biệt hoa thường
+        for k_dict, val in per_class.items():
+            k_upper = str(k_dict).upper()
+            for cand in candidates:
+                if cand.upper() in k_upper and val is not None:
+                    return f"{val * 100:.1f}%"
+        return "N/A"
 
     def log_epoch(self, metrics: dict[str, Any]):
         epoch = metrics.get("epoch", 0)
@@ -3116,10 +3123,10 @@ class DualLogger:
         val_iou = f"{metrics.get('val_mIoU', 0.0) * 100:.2f}%"
 
         per_class = metrics.get("per_class_dice", {})
-        zp = self._fmt_class(per_class, "Zona Pellucida (ZP)", "ZP")
-        te = self._fmt_class(per_class, "Trophectoderm (TE)", "TE")
-        icm = self._fmt_class(per_class, "Inner Cell Mass (ICM)", "ICM")
-        bc = self._fmt_class(per_class, "Blastocyst Cavity (BC)", "BC")
+        zp = self._fmt_class(per_class, "Zona Pellucida (ZP)", "ZP", "Zona")
+        te = self._fmt_class(per_class, "Trophectoderm (TE)", "TE", "Trophectoderm")
+        icm = self._fmt_class(per_class, "Inner Cell Mass (ICM)", "ICM", "Inner")
+        bc = self._fmt_class(per_class, "Blastocyst Cavity (BC)", "BC", "Blastocoel", "Cavity")
 
         row = (
             f"{epoch_str:<8} | {mem_str:<8} | {l_total:<8} | {l_sup:<8} | "

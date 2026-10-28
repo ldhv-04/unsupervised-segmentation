@@ -1,6 +1,6 @@
 dataset:
   format: folder
-  path: data/blastocyst_10p
+  path: dataset/blastocyst_10p
   train: train
   val: valid
   image_size: 256
@@ -29,7 +29,7 @@ augmentation:
 model:
   in_channels: 1
   base_channels: 64
-  num_classes: 4
+  num_classes: 5
   k_iters: 10
 
 loss:

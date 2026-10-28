@@ -132,7 +132,10 @@ def rasterize_coco_record(record: dict, target_size: tuple[int, int]) -> tuple[n
     def draw_priority(ann):
         cname = cats.get(ann["category_id"], "")
         cid = map_category_to_class_id(cname, ann["category_id"])
-        return {4: 0, 1: 1, 2: 2, 3: 3}.get(cid, 0)
+        # Vẽ từ ngoài vào trong: ZP (1) -> TE (2) -> BC (4) -> ICM (3)
+        priority_map = {1: 0, 2: 1, 4: 2, 3: 3}
+        area = float(ann.get("area", 0.0))
+        return (priority_map.get(cid, 0), -area)
 
     for ann in sorted(anns, key=draw_priority):
         cname = cats.get(ann["category_id"], "")
@@ -281,10 +284,11 @@ def main():
         test_items = []
 
     # Chọn lọc phân tầng (Stratified Selection) đúng tỷ lệ labeled_ratio trên tập Train
-    num_labeled_target = max(1, int(round(len(train_items) * args.labeled_ratio)))
+    labeled_train_items = [x for x in train_items if x["mask"] is not None]
+    num_labeled_target = max(1, int(round(len(labeled_train_items) * args.labeled_ratio)))
 
-    # Ưu tiên 1: Ảnh có đủ cả 3 cấu trúc ZP (1), TE (2), ICM (3)
-    tier_full = [x["stem"] for x in train_items if x["mask"] is not None and {1, 2, 3}.issubset(x["classes"])]
+    # Ưu tiên 1: Ảnh có đủ cả 4 cấu trúc ZP (1), TE (2), ICM (3), BC (4)
+    tier_full = [x["stem"] for x in labeled_train_items if {1, 2, 3, 4}.issubset(x["classes"])]
     # Ưu tiên 2: Ảnh có ít nhất 1 cấu trúc có nhãn
     tier_partial = [
         x["stem"] for x in train_items

@@ -90,28 +90,53 @@ def deep_merge(base: dict, update: dict) -> dict:
 
 
 def resolve_data_config(
-    data_input: str | Path | dict,
+    data_input: str | Path | dict | None,
     default_aug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Chuẩn hóa cấu hình dữ liệu đầu vào, giữ nguyên các thiết lập chia tập và tăng cường dữ liệu.
+    Chuẩn hóa cấu hình dữ liệu đầu vào.
+    Hỗ trợ đường dẫn file YAML, thư mục dữ liệu trực tiếp, hoặc dict Python.
     """
-    if isinstance(data_input, (str, Path)):
-        p = Path(data_input)
-        raw_cfg = load_yaml(p)
-        base_dir = p.parent
+    if data_input is None or str(data_input).strip().lower() == "none":
+        raw_cfg = DEFAULT_CONFIG.copy()
+        base_dir = Path.cwd()
+    elif isinstance(data_input, (str, Path)):
+        p = Path(data_input).expanduser()
+        # Nếu người dùng truyền trực tiếp đường dẫn tới thư mục dữ liệu vào --data
+        if p.exists() and p.is_dir():
+            raw_cfg = {
+                "dataset": {
+                    "format": "folder" if (p / "train" / "masks").exists() else "coco",
+                    "path": str(p.resolve()),
+                }
+            }
+            base_dir = p.parent
+        else:
+            raw_cfg = load_yaml(p)
+            base_dir = p.resolve().parent
     elif isinstance(data_input, dict):
         raw_cfg = data_input.copy()
-        base_dir = Path(".")
+        base_dir = Path.cwd()
     else:
         raise TypeError(f"Dữ liệu cấu hình không hợp lệ: {type(data_input)}")
 
-    data_cfg = raw_cfg.get("dataset", raw_cfg)
-    aug_cfg = raw_cfg.get("augmentation", data_cfg.get("augmentation", default_aug or DEFAULT_CONFIG["augmentation"]))
+    data_cfg = raw_cfg.get("dataset") or raw_cfg
+    if not isinstance(data_cfg, dict):
+        raise ValueError(f"Mục 'dataset' trong file cấu hình không hợp lệ: {data_cfg}")
 
-    data_path = Path(data_cfg.get("path") or data_cfg.get("root_dir", "."))
+    aug_cfg = raw_cfg.get(
+        "augmentation",
+        data_cfg.get("augmentation", default_aug or DEFAULT_CONFIG["augmentation"]),
+    )
+
+    raw_path = data_cfg.get("path") or data_cfg.get("root_dir", ".")
+    data_path = Path(raw_path).expanduser()
     if not data_path.is_absolute():
-        data_path = (base_dir / data_path).resolve()
+        # Ưu tiên 1: Tương đối theo thư mục hiện hành (CWD) nếu đường dẫn đó tồn tại
+        cwd_candidate = (Path.cwd() / data_path).resolve()
+        # Ưu tiên 2: Tương đối theo thư mục chứa file YAML
+        yaml_candidate = (base_dir / data_path).resolve()
+        data_path = cwd_candidate if cwd_candidate.exists() else yaml_candidate
 
     resolved: dict[str, Any] = {
         "type": (data_cfg.get("format") or data_cfg.get("type", "coco")).lower(),
@@ -121,14 +146,14 @@ def resolve_data_config(
         "test": data_cfg.get("test", "test"),
         "image_size": int(data_cfg.get("image_size", 256)),
         "names": data_cfg.get("names", DEFAULT_CONFIG["dataset"]["names"]),
-        "augmentation": deep_merge(DEFAULT_CONFIG["augmentation"], aug_cfg),
+        "augmentation": deep_merge(DEFAULT_CONFIG["augmentation"], aug_cfg or {}),
     }
 
     if "labeled_ratio" in data_cfg and data_cfg["labeled_ratio"] is not None:
         resolved["labeled_ratio"] = float(data_cfg["labeled_ratio"])
-    if "split_mode" in data_cfg:
+    if "split_mode" in data_cfg and data_cfg["split_mode"] is not None:
         resolved["split_mode"] = str(data_cfg["split_mode"]).lower()
-    if "use_physical_split" in data_cfg:
+    if "use_physical_split" in data_cfg and data_cfg["use_physical_split"] is not None:
         resolved["use_physical_split"] = bool(data_cfg["use_physical_split"])
 
     return resolved

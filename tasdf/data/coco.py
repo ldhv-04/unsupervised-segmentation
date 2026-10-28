@@ -88,9 +88,9 @@ class COCOEmbryoDataset(BaseEmbryoDataset):
 
         def draw_priority(ann):
             cid = self._map_category_to_class_id(self.cat_id_to_name.get(ann["category_id"], ""))
-            # Vẽ khoang/lớp nền trước, ZP -> TE -> ICM sau để không đè mất cấu trúc nhỏ
-            priority_map = {4: 0, 1: 1, 2: 2, 3: 3}
-            return priority_map.get(cid, 0)
+            priority_map = {1: 0, 2: 1, 4: 2, 3: 3}
+            area = float(ann.get("area", 0.0))
+            return (priority_map.get(cid, 0), -area)
 
         sorted_anns = sorted(anns, key=draw_priority)
         for ann in sorted_anns:
